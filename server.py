@@ -1,14 +1,35 @@
 import tempfile
 import threading
 import uuid
+import os
 from pathlib import Path
+from typing import Annotated
 
 import av
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from faster_whisper import WhisperModel
 
 app = FastAPI(title="Local Speech-to-Text API")
+
+API_KEY = os.getenv("STT_API_KEY", "").strip()
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "STT_CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:9000,http://127.0.0.1:9000",
+    ).split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 model = WhisperModel(
     "base.en",
@@ -20,6 +41,13 @@ model = WhisperModel(
 
 jobs = {}
 jobs_lock = threading.Lock()
+
+
+def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
+    if not API_KEY:
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def _audio_duration_seconds(path: Path) -> float:
@@ -220,6 +248,9 @@ def ui():
 
           <button id=\"submit-btn\" type=\"submit\">Transcribe</button>
         </div>
+        <div class=\"row\">
+          <input id=\"api-key\" name=\"api_key\" type=\"password\" placeholder=\"Optional API key (X-API-Key)\" />
+        </div>
       </form>
 
       <p id=\"status\" class=\"statusline\"></p>
@@ -279,7 +310,9 @@ def ui():
 
       const tick = async () => {
         try {
-          const res = await fetch(`/jobs/${jobId}`);
+          const apiKeyValue = document.getElementById('api-key').value.trim();
+          const headers = apiKeyValue ? { 'X-API-Key': apiKeyValue } : {};
+          const res = await fetch(`/jobs/${jobId}`, { headers });
           if (!res.ok) {
             throw new Error(`Status ${res.status}`);
           }
@@ -356,11 +389,15 @@ def ui():
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
       formData.append('response_format', format);
+      const apiKeyValue = document.getElementById('api-key').value.trim();
 
       status.textContent = 'Uploading file...';
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/transcribe-jobs');
+      if (apiKeyValue) {
+        xhr.setRequestHeader('X-API-Key', apiKeyValue);
+      }
 
       xhr.upload.onprogress = (ev) => {
         if (ev.lengthComputable) {
@@ -421,6 +458,7 @@ def ui():
 async def create_transcription_job(
     file: UploadFile = File(...),
     response_format: str = Form("text"),
+    _: None = Depends(require_api_key),
 ):
     suffix = Path(file.filename or "audio").suffix or ".audio"
 
@@ -451,7 +489,10 @@ async def create_transcription_job(
 
 
 @app.get("/jobs/{job_id}")
-def get_job_status(job_id: str):
+def get_job_status(
+    job_id: str,
+    _: None = Depends(require_api_key),
+):
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -463,6 +504,7 @@ def get_job_status(job_id: str):
 async def transcribe(
     file: UploadFile = File(...),
     response_format: str = Form("text"),
+    _: None = Depends(require_api_key),
 ):
     suffix = Path(file.filename).suffix or ".audio"
 

@@ -73,6 +73,14 @@ source .venv/bin/activate
 uvicorn server:app --host 127.0.0.1 --port 9000
 ```
 
+For domain/external usage, set security env vars before starting:
+
+```bash
+export STT_API_KEY="replace-with-a-long-random-secret"
+export STT_CORS_ORIGINS="https://your-app.com,https://admin.your-app.com"
+uvicorn server:app --host 127.0.0.1 --port 9000
+```
+
 Open in browser:
 - UI: `http://127.0.0.1:9000/ui`
 - Swagger docs: `http://127.0.0.1:9000/docs`
@@ -86,23 +94,224 @@ uvicorn server:app --host 127.0.0.1 --port 9001
 
 Then use `http://127.0.0.1:9001/ui`.
 
-## 4) First-time model download behavior
+## 4) Deploy on Laravel Forge (Domain + HTTPS)
 
-On the first transcription request, `faster-whisper` downloads model `base.en` and caches it locally.
-- First run is slower
-- Later runs are faster (cached model)
+This is the recommended production flow for your use case.
 
-## 5) Use the browser UI
+### 4.1 Create server and site in Forge
+
+1. Provision an Ubuntu server (AWS or DigitalOcean) from Forge.
+2. Create a site, for example: `stt-api.yourdomain.com`.
+3. Enable SSL in Forge (Let's Encrypt).
+4. Point DNS `A` record to the server IP.
+
+### 4.2 Upload project to server
+
+Option A: Git deploy (recommended)
+
+```bash
+git clone <your-repo-url> /home/forge/stt-local
+cd /home/forge/stt-local
+```
+
+Option B: upload tar/zip and extract to `/home/forge/stt-local`.
+
+### 4.3 Install dependencies
+
+```bash
+cd /home/forge/stt-local
+./install.sh
+```
+
+### 4.4 Set environment variables
+
+Add to shell profile or service config:
+
+```bash
+export STT_API_KEY="replace-with-a-long-random-secret"
+export STT_CORS_ORIGINS="https://your-frontend.com,https://admin.your-frontend.com"
+```
+
+### 4.5 Create systemd service (recommended)
+
+Create `/etc/systemd/system/stt-local.service`:
+
+```ini
+[Unit]
+Description=STT Local FastAPI Service
+After=network.target
+
+[Service]
+User=forge
+Group=forge
+WorkingDirectory=/home/forge/stt-local
+Environment="STT_API_KEY=replace-with-a-long-random-secret"
+Environment="STT_CORS_ORIGINS=https://your-frontend.com,https://admin.your-frontend.com"
+ExecStart=/home/forge/stt-local/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 9000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable stt-local
+sudo systemctl start stt-local
+sudo systemctl status stt-local
+```
+
+### 4.6 Configure Nginx reverse proxy (Forge site)
+
+In your Forge site Nginx config, proxy requests to local uvicorn:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Tune for large audio/video uploads
+    client_max_body_size 1024M;
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 3600s;
+    proxy_read_timeout 3600s;
+}
+```
+
+Reload Nginx from Forge UI or:
+
+```bash
+sudo systemctl reload nginx
+```
+
+### 4.7 Verify deployment
+
+```bash
+curl https://stt-api.yourdomain.com/
+curl -X POST https://stt-api.yourdomain.com/transcribe-jobs \
+  -H "X-API-Key: replace-with-a-long-random-secret" \
+  -F "file=@sample.mp3" \
+  -F "response_format=json"
+```
+
+## 5) Deploy on AWS EC2 (without Forge)
+
+### 5.1 Launch and access EC2
+
+1. Launch Ubuntu EC2 instance.
+2. Open security group ports:
+   - `22` (SSH)
+   - `80` (HTTP)
+   - `443` (HTTPS)
+3. SSH in:
+
+```bash
+ssh -i /path/to/key.pem ubuntu@<ec2-public-ip>
+```
+
+### 5.2 Install system packages
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip ffmpeg nginx certbot python3-certbot-nginx git
+```
+
+### 5.3 Deploy app
+
+```bash
+git clone <your-repo-url> /opt/stt-local
+cd /opt/stt-local
+./install.sh
+```
+
+### 5.4 Create systemd service
+
+Create `/etc/systemd/system/stt-local.service` (same as Forge section; set `User=ubuntu`, `WorkingDirectory=/opt/stt-local`, and `.venv` path accordingly):
+
+```ini
+[Unit]
+Description=STT Local FastAPI Service
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/stt-local
+Environment="STT_API_KEY=replace-with-a-long-random-secret"
+Environment="STT_CORS_ORIGINS=https://your-frontend.com"
+ExecStart=/opt/stt-local/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 9000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Start service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable stt-local
+sudo systemctl start stt-local
+```
+
+### 5.5 Nginx domain config
+
+Create `/etc/nginx/sites-available/stt-local`:
+
+```nginx
+server {
+    server_name stt-api.yourdomain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:9000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        client_max_body_size 1024M;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+Enable config:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/stt-local /etc/nginx/sites-enabled/stt-local
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Enable HTTPS:
+
+```bash
+sudo certbot --nginx -d stt-api.yourdomain.com
+```
+
+## 6) Use the browser UI
 
 1. Open `/ui`
 2. Choose audio/video file
 3. Choose output format (`text` or `json`)
-4. Click **Transcribe**
-5. Track:
+4. Enter API key in the UI field (if `STT_API_KEY` enabled)
+5. Click **Transcribe**
+6. Track:
    - Upload progress bar
    - Transcription progress bar (polled from async job status)
 
-## 6) Local script mode (no server)
+## 7) Local script mode (no server)
 
 Put files into `media/`, for example:
 - `media/sample.mp3`
@@ -117,14 +326,15 @@ python transcribe.py
 
 Output is written to `transcripts/<filename>.txt`.
 
-## 7) API usage
+## 8) API usage
 
 ### A) Async endpoint (recommended for large files)
 
 Create job:
 
 ```bash
-curl -X POST http://127.0.0.1:9000/transcribe-jobs \
+curl -X POST https://stt-api.yourdomain.com/transcribe-jobs \
+  -H "X-API-Key: replace-with-a-long-random-secret" \
   -F "file=@media/sample.mp3" \
   -F "response_format=json"
 ```
@@ -138,7 +348,8 @@ Example response:
 Poll status:
 
 ```bash
-curl http://127.0.0.1:9000/jobs/<id>
+curl -H "X-API-Key: replace-with-a-long-random-secret" \
+  https://stt-api.yourdomain.com/jobs/<id>
 ```
 
 Job states:
@@ -154,14 +365,15 @@ When `done`, response includes:
 ### B) Direct blocking endpoint (simple)
 
 ```bash
-curl -X POST http://127.0.0.1:9000/transcribe \
+curl -X POST https://stt-api.yourdomain.com/transcribe \
+  -H "X-API-Key: replace-with-a-long-random-secret" \
   -F "file=@media/sample.mp3" \
   -F "response_format=text"
 ```
 
 Note: this endpoint returns only after transcription completes.
 
-## 8) Reinstall on another computer
+## 9) Reinstall on another computer
 
 1. Copy/pull this folder
 2. Install prerequisites (`python3`, `python3-venv`, `ffmpeg`)
@@ -171,12 +383,14 @@ Note: this endpoint returns only after transcription completes.
 cd stt-local
 ./install.sh
 source .venv/bin/activate
+export STT_API_KEY="replace-with-a-long-random-secret"
+export STT_CORS_ORIGINS="https://your-app.com"
 uvicorn server:app --host 127.0.0.1 --port 9000
 ```
 
 4. Open `/ui`
 
-## 9) Updating dependencies
+## 10) Updating dependencies
 
 If you add/change packages:
 
@@ -186,7 +400,7 @@ pip install <new-package>
 pip freeze > requirements.txt
 ```
 
-## 10) Troubleshooting
+## 11) Troubleshooting
 
 ### `address already in use` on port 9000
 
@@ -201,6 +415,18 @@ uvicorn server:app --host 127.0.0.1 --port 9001
 `/transcribe` is `POST` only. Use:
 - `/ui`, or
 - `curl -X POST ...`
+
+### `{"detail":"Invalid or missing API key"}`
+
+Your server has `STT_API_KEY` enabled and request is missing/incorrect `X-API-Key` header.
+
+### Browser call blocked by CORS
+
+Add your frontend origin to `STT_CORS_ORIGINS`, comma-separated:
+
+```bash
+export STT_CORS_ORIGINS="https://your-app.com,https://staging.your-app.com"
+```
 
 ### Slow first transcription
 
