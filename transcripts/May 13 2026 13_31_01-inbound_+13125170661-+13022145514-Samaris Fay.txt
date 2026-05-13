@@ -1,0 +1,12 @@
+File: May 13 2026 13_31_01-inbound_+13125170661-+13022145514-Samaris Fay.mp3
+Detected language: en
+
+[0.00 - 1.84] Call has been forwarded to voicemail.
+[1.92 - 4.04] The person you're trying to reach is not available.
+[4.16 - 6.36] At the tone, please record your message.
+[6.44 - 8.36] When you have finished recording, you may hang up.
+[10.12 - 12.40] Hello, this message is for Charlie Steele.
+[12.40 - 14.68] This is Samara's coming from Face Services.
+[15.08 - 20.12] If you please give me a call back at toll-free, 888-201-3780.
+[20.20 - 25.40] My direct number is 312-517-0661.
+[25.52 - 26.04] Thank you.
