@@ -2,6 +2,8 @@ import tempfile
 import threading
 import uuid
 import os
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -41,7 +43,70 @@ model = WhisperModel(
 
 jobs = {}
 jobs_lock = threading.Lock()
+history_lock = threading.Lock()
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+HISTORY_DIR = Path("transcripts_history")
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_base_name(filename: str | None) -> str:
+    raw = Path(filename or "transcript").stem
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw)
+    return safe.strip("-_") or "transcript"
+
+
+def _persist_history(filename: str | None, text_output: str, json_output: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%dT%H%M%SZ")
+    history_id = f"{ts}-{uuid.uuid4().hex[:8]}"
+    record = {
+        "id": history_id,
+        "filename": filename or "unknown",
+        "basename": _safe_base_name(filename),
+        "created_at": now.isoformat(),
+        "result_text": text_output,
+        "result_json": json_output,
+    }
+    target = HISTORY_DIR / f"{history_id}.json"
+    with history_lock:
+        with target.open("w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+    return {
+        "id": record["id"],
+        "filename": record["filename"],
+        "basename": record["basename"],
+        "created_at": record["created_at"],
+    }
+
+
+def _list_history(limit: int = 200) -> list[dict]:
+    items = []
+    with history_lock:
+        files = sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.name, reverse=True)
+    for path in files[:limit]:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            items.append(
+                {
+                    "id": data.get("id", path.stem),
+                    "filename": data.get("filename", "unknown"),
+                    "basename": data.get("basename", _safe_base_name(data.get("filename"))),
+                    "created_at": data.get("created_at"),
+                }
+            )
+        except Exception:
+            continue
+    return items
+
+
+def _read_history(history_id: str) -> dict:
+    path = HISTORY_DIR / f"{history_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="History entry not found")
+    with history_lock:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
@@ -115,6 +180,7 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
             "segments": segment_list,
             "text": " ".join(item["text"] for item in segment_list),
         }
+        history_entry = _persist_history(original_name, text_output, json_output)
 
         with jobs_lock:
             if jobs[job_id]["status"] == "cancel_requested":
@@ -126,6 +192,7 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
             jobs[job_id]["progress"] = 100.0
             jobs[job_id]["result_text"] = text_output
             jobs[job_id]["result_json"] = json_output
+            jobs[job_id]["history_id"] = history_entry["id"]
     except Exception as exc:
         with jobs_lock:
             jobs[job_id]["status"] = "error"
@@ -223,22 +290,30 @@ def ui():
     }
     .wrap { max-width: 860px; margin: 0 auto; }
     .card {
+      position: relative;
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 16px;
       padding: 20px;
       box-shadow: 0 12px 34px rgba(11, 33, 63, 0.1);
     }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .title-wrap { min-width: 0; }
     h1 { margin: 0 0 8px; letter-spacing: 0.2px; }
     .muted { color: var(--muted); margin: 0 0 18px; }
     .row { margin: 14px 0; }
     .grid {
       display: grid;
       gap: 12px;
-      grid-template-columns: 1fr 180px auto auto;
+      grid-template-columns: 1fr auto auto;
       align-items: center;
     }
-    input[type=file], select {
+    input[type=file] {
       width: 100%;
       border: 1px solid var(--border);
       background: #fafdff;
@@ -256,11 +331,49 @@ def ui():
       cursor: pointer;
     }
     .cancel-button { background: #d94848; }
+    .reset-button {
+      background: #facc15;
+      color: #1f2937;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+    }
+    .reset-icon {
+      font-size: 14px;
+      line-height: 1;
+    }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     .statusline { margin: 10px 0 0; color: var(--muted); font-size: 14px; min-height: 20px; }
     .progress-wrap { margin-top: 14px; }
+    .hidden { display: none; }
     .progress-label { font-size: 13px; color: var(--muted); margin-bottom: 6px; display: flex; justify-content: space-between; }
     .download-actions { display: flex; gap: 10px; margin-top: 14px; }
+    .tabs { display: flex; gap: 10px; margin-top: 16px; }
+    .tab-btn { background: #e2e8f0; color: #0f172a; }
+    .tab-btn.active { background: #2563eb; color: #fff; }
+    .history-actions { margin-top: 12px; }
+    .history-list {
+      margin-top: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      max-height: 280px;
+      overflow: auto;
+      background: #f9fbff;
+    }
+    .history-item {
+      width: 100%;
+      text-align: left;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      border-radius: 0;
+      background: transparent;
+      color: var(--ink);
+      padding: 10px 12px;
+      font-weight: 500;
+    }
+    .history-item:last-child { border-bottom: 0; }
+    .history-meta { color: var(--muted); font-size: 12px; }
     .progress {
       width: 100%;
       height: 12px;
@@ -296,49 +409,65 @@ def ui():
       .grid { grid-template-columns: 1fr; }
       .download-actions { flex-direction: column; }
       button { width: 100%; }
+      .reset-button { width: auto; }
     }
   </style>
 </head>
 <body>
   <div class=\"wrap\">
     <div class=\"card\">
-      <h1>Local Speech-to-Text</h1>
-      <p class=\"muted\">Upload audio/video and track progress while transcribing.</p>
-      <p class=\"muted\"><strong>Deploy Check:</strong> Auto deploy marker v2</p>
+      <div class=\"card-header\">
+        <div class=\"title-wrap\">
+          <h1>Local Speech-to-Text</h1>
+          <p class=\"muted\">Upload audio/video and track progress while transcribing.</p>
+        </div>
+        <button id=\"reset-btn\" class=\"reset-button\" type=\"button\" title=\"Reset\">
+          <span class=\"reset-icon\" aria-hidden=\"true\">↺</span>
+          <span>Reset</span>
+        </button>
+      </div>
 
       <form id=\"upload-form\">
         <div class=\"row grid\">
           <input id=\"file\" name=\"file\" type=\"file\" accept=\"audio/*,video/*\" required />
 
-          <select id=\"format\" name=\"response_format\">
-            <option value=\"text\" selected>text</option>
-            <option value=\"json\">json</option>
-          </select>
-
           <button id=\"submit-btn\" type=\"submit\">Transcribe</button>
           <button id=\"cancel-btn\" class=\"cancel-button\" type=\"button\" disabled>Cancel</button>
-          <button id=\"reset-btn\" type=\"button\">Reset</button>
         </div>
       </form>
 
       <p id=\"status\" class=\"statusline\"></p>
 
-      <div class=\"progress-wrap\">
+      <div id=\"upload-progress-wrap\" class=\"progress-wrap hidden\">
         <div class=\"progress-label\"><span>Upload</span><span id=\"upload-pct\">0%</span></div>
         <div class=\"progress\"><div id=\"upload-bar\" class=\"bar\"></div></div>
       </div>
 
-      <div class=\"progress-wrap\">
+      <div id=\"transcribe-progress-wrap\" class=\"progress-wrap hidden\">
         <div class=\"progress-label\"><span>Transcription</span><span id=\"transcribe-pct\">0%</span></div>
         <div class=\"progress\"><div id=\"transcribe-bar\" class=\"bar\"></div></div>
       </div>
 
-      <div class=\"download-actions\">
+      <div id=\"download-actions\" class=\"download-actions hidden\">
         <button id=\"download-text-btn\" type=\"button\" disabled>Download TXT</button>
         <button id=\"download-json-btn\" type=\"button\" disabled>Download JSON</button>
       </div>
 
-      <pre id=\"result\"></pre>
+      <div class=\"tabs\">
+        <button id=\"result-tab-btn\" class=\"tab-btn active\" type=\"button\">Result</button>
+        <button id=\"history-tab-btn\" class=\"tab-btn\" type=\"button\">History</button>
+      </div>
+
+      <div id=\"result-panel\">
+        <pre id=\"result\"></pre>
+      </div>
+
+      <div id=\"history-panel\" class=\"hidden\">
+        <div class=\"history-actions\">
+          <button id=\"refresh-history-btn\" type=\"button\">Refresh History</button>
+        </div>
+        <div id=\"history-list\" class=\"history-list\"></div>
+      </div>
     </div>
   </div>
 
@@ -351,6 +480,15 @@ def ui():
     const resetBtn = document.getElementById('reset-btn');
     const downloadTextBtn = document.getElementById('download-text-btn');
     const downloadJsonBtn = document.getElementById('download-json-btn');
+    const resultTabBtn = document.getElementById('result-tab-btn');
+    const historyTabBtn = document.getElementById('history-tab-btn');
+    const resultPanel = document.getElementById('result-panel');
+    const historyPanel = document.getElementById('history-panel');
+    const refreshHistoryBtn = document.getElementById('refresh-history-btn');
+    const historyList = document.getElementById('history-list');
+    const uploadProgressWrap = document.getElementById('upload-progress-wrap');
+    const transcribeProgressWrap = document.getElementById('transcribe-progress-wrap');
+    const downloadActions = document.getElementById('download-actions');
     const uploadBar = document.getElementById('upload-bar');
     const uploadPct = document.getElementById('upload-pct');
     const transcribeBar = document.getElementById('transcribe-bar');
@@ -362,6 +500,68 @@ def ui():
     let lastResultText = '';
     let lastResultJson = null;
     let lastResultBaseName = 'transcript';
+    let historyEntries = [];
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function setActiveTab(tab) {
+      const resultActive = tab === 'result';
+      resultTabBtn.classList.toggle('active', resultActive);
+      historyTabBtn.classList.toggle('active', !resultActive);
+      resultPanel.classList.toggle('hidden', !resultActive);
+      historyPanel.classList.toggle('hidden', resultActive);
+    }
+
+    function hydrateResult(entry) {
+      lastResultText = entry.result_text || '';
+      lastResultJson = entry.result_json || null;
+      lastResultBaseName = safeBaseName(entry.filename || 'transcript');
+      result.textContent = lastResultText;
+      downloadTextBtn.disabled = !lastResultText;
+      downloadJsonBtn.disabled = !lastResultJson;
+      downloadActions.classList.remove('hidden');
+      status.textContent = `Loaded history: ${entry.filename || entry.id}`;
+      setActiveTab('result');
+    }
+
+    async function loadHistoryDetail(id) {
+      const res = await fetch(`/ui/history/${id}`);
+      if (!res.ok) {
+        throw new Error(`History fetch failed (${res.status})`);
+      }
+      const entry = await res.json();
+      hydrateResult(entry);
+    }
+
+    function renderHistory() {
+      if (!historyEntries.length) {
+        historyList.innerHTML = '<div class="history-item">No history yet.</div>';
+        return;
+      }
+      historyList.innerHTML = historyEntries.map((entry) => {
+        const filename = escapeHtml(entry.filename || 'unknown');
+        const created = escapeHtml(entry.created_at || '');
+        const id = escapeHtml(entry.id);
+        return `<button class="history-item" type="button" data-history-id="${id}"><div>${filename}</div><div class="history-meta">${created}</div></button>`;
+      }).join('');
+    }
+
+    async function refreshHistory() {
+      const res = await fetch('/ui/history');
+      if (!res.ok) {
+        throw new Error(`History list failed (${res.status})`);
+      }
+      const data = await res.json();
+      historyEntries = Array.isArray(data.items) ? data.items : [];
+      renderHistory();
+    }
 
     function setUploadProgress(pct) {
       const clamped = Math.max(0, Math.min(100, pct));
@@ -391,6 +591,9 @@ def ui():
       cancelBtn.disabled = true;
       downloadTextBtn.disabled = true;
       downloadJsonBtn.disabled = true;
+      uploadProgressWrap.classList.add('hidden');
+      transcribeProgressWrap.classList.add('hidden');
+      downloadActions.classList.add('hidden');
     }
 
     function safeBaseName(filename) {
@@ -429,6 +632,7 @@ def ui():
           }
 
           if (data.status === 'transcribing') {
+            transcribeProgressWrap.classList.remove('hidden');
             transcribeBar.classList.add('busy');
             status.textContent = data.message || 'Transcribing audio...';
             return;
@@ -449,15 +653,13 @@ def ui():
             lastResultText = data.result_text || '';
             lastResultJson = data.result_json || null;
             lastResultBaseName = safeBaseName(data.filename || (data.result_json && data.result_json.filename));
-            if (format === 'json') {
-              result.textContent = JSON.stringify(lastResultJson, null, 2);
-            } else {
-              result.textContent = lastResultText;
-            }
+            result.textContent = lastResultText;
             submitBtn.disabled = false;
             cancelBtn.disabled = true;
             downloadTextBtn.disabled = !lastResultText;
             downloadJsonBtn.disabled = !lastResultJson;
+            downloadActions.classList.remove('hidden');
+            refreshHistory().catch(() => {});
             return;
           }
 
@@ -508,7 +710,7 @@ def ui():
       cancelBtn.disabled = false;
 
       const fileInput = document.getElementById('file');
-      const format = document.getElementById('format').value;
+      const format = 'text';
 
       if (!fileInput.files.length) {
         status.textContent = 'Choose a file first.';
@@ -522,6 +724,7 @@ def ui():
       formData.append('response_format', format);
 
       status.textContent = 'Uploading file...';
+      uploadProgressWrap.classList.remove('hidden');
 
       const xhr = new XMLHttpRequest();
       activeXhr = xhr;
@@ -536,6 +739,7 @@ def ui():
       xhr.upload.onload = () => {
         setUploadProgress(100);
         status.textContent = 'Upload complete. Starting transcription...';
+        transcribeProgressWrap.classList.remove('hidden');
         transcribeBar.classList.add('busy');
       };
 
@@ -643,6 +847,34 @@ def ui():
     });
 
     resetBtn.addEventListener('click', resetForm);
+    resultTabBtn.addEventListener('click', () => setActiveTab('result'));
+    historyTabBtn.addEventListener('click', () => {
+      setActiveTab('history');
+      refreshHistory().catch((error) => {
+        status.textContent = 'Failed to load history.';
+        result.textContent = String(error);
+      });
+    });
+    refreshHistoryBtn.addEventListener('click', () => {
+      refreshHistory().catch((error) => {
+        status.textContent = 'Failed to refresh history.';
+        result.textContent = String(error);
+      });
+    });
+    historyList.addEventListener('click', (event) => {
+      const target = event.target.closest('[data-history-id]');
+      if (!target) {
+        return;
+      }
+      const id = target.getAttribute('data-history-id');
+      if (!id) {
+        return;
+      }
+      loadHistoryDetail(id).catch((error) => {
+        status.textContent = 'Failed to load history entry.';
+        result.textContent = String(error);
+      });
+    });
 
     downloadTextBtn.addEventListener('click', () => {
       if (!lastResultText) {
@@ -661,6 +893,7 @@ def ui():
         'application/json;charset=utf-8'
       );
     });
+    refreshHistory().catch(() => {});
   </script>
 </body>
 </html>
@@ -717,6 +950,16 @@ def cancel_ui_job(job_id: str):
     return _cancel_job(job_id)
 
 
+@app.get("/ui/history")
+def list_ui_history():
+    return {"items": _list_history()}
+
+
+@app.get("/ui/history/{history_id}")
+def get_ui_history(history_id: str):
+    return _read_history(history_id)
+
+
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
@@ -746,17 +989,19 @@ async def transcribe(
             segment_list.append(item)
             lines.append(f"[{segment.start:.2f} - {segment.end:.2f}] {segment.text.strip()}")
 
-        if response_format == "json":
-            return JSONResponse(
-                {
-                    "filename": file.filename,
-                    "language": info.language,
-                    "segments": segment_list,
-                    "text": " ".join(item["text"] for item in segment_list),
-                }
-            )
+        text_output = "\n".join(lines)
+        json_output = {
+            "filename": file.filename,
+            "language": info.language,
+            "segments": segment_list,
+            "text": " ".join(item["text"] for item in segment_list),
+        }
+        _persist_history(file.filename, text_output, json_output)
 
-        return PlainTextResponse("\n".join(lines))
+        if response_format == "json":
+            return JSONResponse(json_output)
+
+        return PlainTextResponse(text_output)
 
     finally:
         temp_path.unlink(missing_ok=True)
