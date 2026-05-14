@@ -264,7 +264,7 @@ def ui():
     <div class=\"card\">
       <h1>Local Speech-to-Text</h1>
       <p class=\"muted\">Upload audio/video and track progress while transcribing.</p>
-      <p class=\"muted\"><strong>Deploy Check:</strong> UI update marker v1</p>
+      <p class=\"muted\"><strong>Deploy Check:</strong> Auto deploy marker v2</p>
 
       <form id=\"upload-form\">
         <div class=\"row grid\">
