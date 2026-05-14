@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Annotated
 
 import av
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from faster_whisper import WhisperModel
@@ -79,11 +79,20 @@ def _persist_history(filename: str | None, text_output: str, json_output: dict) 
     }
 
 
-def _list_history(limit: int = 200) -> list[dict]:
+def _list_history(page: int = 1, page_size: int = 20) -> dict:
     items = []
     with history_lock:
         files = sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.name, reverse=True)
-    for path in files[:limit]:
+    total_items = len(files)
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 1
+    if page_size > 100:
+        page_size = 100
+    start = (page - 1) * page_size
+    end = start + page_size
+    for path in files[start:end]:
         try:
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -97,7 +106,14 @@ def _list_history(limit: int = 200) -> list[dict]:
             )
         except Exception:
             continue
-    return items
+    total_pages = (total_items + page_size - 1) // page_size if total_items else 1
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total_items": total_items,
+        "total_pages": total_pages,
+    }
 
 
 def _read_history(history_id: str) -> dict:
@@ -353,6 +369,13 @@ def ui():
     .tab-btn { background: #e2e8f0; color: #0f172a; }
     .tab-btn.active { background: #2563eb; color: #fff; }
     .history-actions { margin-top: 12px; }
+    .history-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .history-page-info { color: var(--muted); font-size: 13px; }
     .history-list {
       margin-top: 12px;
       border: 1px solid var(--border);
@@ -464,7 +487,12 @@ def ui():
 
       <div id=\"history-panel\" class=\"hidden\">
         <div class=\"history-actions\">
-          <button id=\"refresh-history-btn\" type=\"button\">Refresh History</button>
+          <div class=\"history-controls\">
+            <button id=\"refresh-history-btn\" type=\"button\">Refresh History</button>
+            <button id=\"history-prev-btn\" type=\"button\">Previous</button>
+            <button id=\"history-next-btn\" type=\"button\">Next</button>
+            <span id=\"history-page-info\" class=\"history-page-info\"></span>
+          </div>
         </div>
         <div id=\"history-list\" class=\"history-list\"></div>
       </div>
@@ -485,6 +513,9 @@ def ui():
     const resultPanel = document.getElementById('result-panel');
     const historyPanel = document.getElementById('history-panel');
     const refreshHistoryBtn = document.getElementById('refresh-history-btn');
+    const historyPrevBtn = document.getElementById('history-prev-btn');
+    const historyNextBtn = document.getElementById('history-next-btn');
+    const historyPageInfo = document.getElementById('history-page-info');
     const historyList = document.getElementById('history-list');
     const uploadProgressWrap = document.getElementById('upload-progress-wrap');
     const transcribeProgressWrap = document.getElementById('transcribe-progress-wrap');
@@ -501,6 +532,10 @@ def ui():
     let lastResultJson = null;
     let lastResultBaseName = 'transcript';
     let historyEntries = [];
+    let historyPage = 1;
+    let historyPageSize = 20;
+    let historyTotalPages = 1;
+    let historyTotalItems = 0;
 
     function escapeHtml(value) {
       return String(value)
@@ -543,23 +578,44 @@ def ui():
     function renderHistory() {
       if (!historyEntries.length) {
         historyList.innerHTML = '<div class="history-item">No history yet.</div>';
+        historyPageInfo.textContent = `Page ${historyPage} of ${historyTotalPages} (${historyTotalItems} total)`;
+        historyPrevBtn.disabled = historyPage <= 1;
+        historyNextBtn.disabled = historyPage >= historyTotalPages;
         return;
       }
+      const dtf = new Intl.DateTimeFormat(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
       historyList.innerHTML = historyEntries.map((entry) => {
         const filename = escapeHtml(entry.filename || 'unknown');
-        const created = escapeHtml(entry.created_at || '');
+        const createdRaw = entry.created_at || '';
+        const createdFormatted = createdRaw ? dtf.format(new Date(createdRaw)) : '';
+        const created = escapeHtml(createdFormatted);
         const id = escapeHtml(entry.id);
         return `<button class="history-item" type="button" data-history-id="${id}"><div>${filename}</div><div class="history-meta">${created}</div></button>`;
       }).join('');
+      historyPageInfo.textContent = `Page ${historyPage} of ${historyTotalPages} (${historyTotalItems} total)`;
+      historyPrevBtn.disabled = historyPage <= 1;
+      historyNextBtn.disabled = historyPage >= historyTotalPages;
     }
 
-    async function refreshHistory() {
-      const res = await fetch('/ui/history');
+    async function refreshHistory(page = historyPage) {
+      const targetPage = Math.max(1, page);
+      const res = await fetch(`/ui/history?page=${targetPage}&page_size=${historyPageSize}`);
       if (!res.ok) {
         throw new Error(`History list failed (${res.status})`);
       }
       const data = await res.json();
       historyEntries = Array.isArray(data.items) ? data.items : [];
+      historyPage = Number(data.page) || 1;
+      historyPageSize = Number(data.page_size) || historyPageSize;
+      historyTotalPages = Number(data.total_pages) || 1;
+      historyTotalItems = Number(data.total_items) || 0;
       renderHistory();
     }
 
@@ -856,8 +912,26 @@ def ui():
       });
     });
     refreshHistoryBtn.addEventListener('click', () => {
-      refreshHistory().catch((error) => {
+      refreshHistory(1).catch((error) => {
         status.textContent = 'Failed to refresh history.';
+        result.textContent = String(error);
+      });
+    });
+    historyPrevBtn.addEventListener('click', () => {
+      if (historyPage <= 1) {
+        return;
+      }
+      refreshHistory(historyPage - 1).catch((error) => {
+        status.textContent = 'Failed to load previous history page.';
+        result.textContent = String(error);
+      });
+    });
+    historyNextBtn.addEventListener('click', () => {
+      if (historyPage >= historyTotalPages) {
+        return;
+      }
+      refreshHistory(historyPage + 1).catch((error) => {
+        status.textContent = 'Failed to load next history page.';
         result.textContent = String(error);
       });
     });
@@ -951,8 +1025,11 @@ def cancel_ui_job(job_id: str):
 
 
 @app.get("/ui/history")
-def list_ui_history():
-    return {"items": _list_history()}
+def list_ui_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    return _list_history(page=page, page_size=page_size)
 
 
 @app.get("/ui/history/{history_id}")
