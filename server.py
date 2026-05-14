@@ -41,6 +41,7 @@ model = WhisperModel(
 
 jobs = {}
 jobs_lock = threading.Lock()
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
@@ -145,12 +146,22 @@ def _cancel_job(job_id: str) -> dict:
         return dict(job)
 
 
-async def _create_job(file: UploadFile, response_format: str) -> dict:
+async def _save_upload_to_temp(file: UploadFile) -> Path:
     suffix = Path(file.filename or "audio").suffix or ".audio"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
         temp_path = Path(temp.name)
-        temp.write(await file.read())
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            temp.write(chunk)
+
+    return temp_path
+
+
+async def _create_job(file: UploadFile, response_format: str) -> dict:
+    temp_path = await _save_upload_to_temp(file)
 
     job_id = uuid.uuid4().hex
 
@@ -712,11 +723,7 @@ async def transcribe(
     response_format: str = Form("text"),
     _: None = Depends(require_api_key),
 ):
-    suffix = Path(file.filename).suffix or ".audio"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
-        temp_path = Path(temp.name)
-        temp.write(await file.read())
+    temp_path = await _save_upload_to_temp(file)
 
     try:
         segments, info = model.transcribe(
