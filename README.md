@@ -201,6 +201,34 @@ curl -X POST https://stt-api.yourdomain.com/transcribe-jobs \
   -F "response_format=json"
 ```
 
+### 4.8 Auto-deploy and restart on every push
+
+Use this when Forge does not provide a daemon UI. The repo includes `forge-deploy.sh`, which creates/updates the shared Python venv, stops the old Uvicorn process, and starts the new one in the background.
+
+In `/home/forge/transcribe.on-forge.com/.env`, add:
+
+```bash
+STT_API_KEY=replace-with-a-long-random-secret
+STT_CORS_ORIGINS=https://transcribe.on-forge.com
+```
+
+In Forge site Deployment Script, use only this:
+
+```bash
+cd /home/forge/transcribe.on-forge.com/current
+chmod +x forge-deploy.sh
+./forge-deploy.sh
+```
+
+Then enable Auto Deploy for the `main` branch. After each push, Forge deploys the new release and runs `forge-deploy.sh`, so the running server reloads the latest code.
+
+To verify after deployment:
+
+```bash
+curl http://127.0.0.1:9000/
+tail -n 50 /home/forge/transcribe.on-forge.com/uvicorn.log
+```
+
 ## 5) Deploy on AWS EC2 (without Forge)
 
 ### 5.1 Launch and access EC2

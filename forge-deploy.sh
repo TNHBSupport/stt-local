@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_ROOT="${APP_ROOT:-/home/forge/transcribe.on-forge.com}"
+CURRENT_DIR="${APP_ROOT}/current"
+VENV_DIR="${APP_ROOT}/shared-venv"
+LOG_FILE="${APP_ROOT}/uvicorn.log"
+PID_FILE="${APP_ROOT}/uvicorn.pid"
+HOST="${STT_HOST:-127.0.0.1}"
+PORT="${STT_PORT:-9000}"
+
+if [ -f "${APP_ROOT}/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "${APP_ROOT}/.env"
+  set +a
+fi
+
+if [ ! -d "${VENV_DIR}" ]; then
+  python3 -m venv "${VENV_DIR}"
+fi
+
+"${VENV_DIR}/bin/python3" -m pip install --upgrade pip
+"${VENV_DIR}/bin/python3" -m pip install -r "${CURRENT_DIR}/requirements.txt"
+
+if [ -f "${PID_FILE}" ]; then
+  OLD_PID="$(cat "${PID_FILE}")"
+  if kill -0 "${OLD_PID}" >/dev/null 2>&1; then
+    kill "${OLD_PID}" || true
+    sleep 2
+  fi
+fi
+
+pkill -f "uvicorn server:app --host ${HOST} --port ${PORT}" || true
+
+cd "${CURRENT_DIR}"
+nohup "${VENV_DIR}/bin/uvicorn" server:app --host "${HOST}" --port "${PORT}" > "${LOG_FILE}" 2>&1 &
+echo "$!" > "${PID_FILE}"
+
+sleep 2
+curl -fsS "http://${HOST}:${PORT}/" >/dev/null
+
+echo "STT server restarted on ${HOST}:${PORT}"
