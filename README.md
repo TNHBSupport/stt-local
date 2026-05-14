@@ -82,7 +82,7 @@ uvicorn server:app --host 127.0.0.1 --port 9000
 ```
 
 Open in browser:
-- UI: `http://127.0.0.1:9000/ui`
+- UI: `http://127.0.0.1:9000/ui` (no API key field; uses internal UI routes)
 - Swagger docs: `http://127.0.0.1:9000/docs`
 - Health check: `http://127.0.0.1:9000/`
 
@@ -305,9 +305,8 @@ sudo certbot --nginx -d stt-api.yourdomain.com
 1. Open `/ui`
 2. Choose audio/video file
 3. Choose output format (`text` or `json`)
-4. Enter API key in the UI field (if `STT_API_KEY` enabled)
-5. Click **Transcribe**
-6. Track:
+4. Click **Transcribe**
+5. Track:
    - Upload progress bar
    - Transcription progress bar (polled from async job status)
 

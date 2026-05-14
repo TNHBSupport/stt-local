@@ -119,6 +119,34 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
         temp_path.unlink(missing_ok=True)
 
 
+async def _create_job(file: UploadFile, response_format: str) -> dict:
+    suffix = Path(file.filename or "audio").suffix or ".audio"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+        temp_path = Path(temp.name)
+        temp.write(await file.read())
+
+    job_id = uuid.uuid4().hex
+
+    with jobs_lock:
+        jobs[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0.0,
+            "message": "Queued",
+            "filename": file.filename,
+            "response_format": response_format,
+            "processed_seconds": 0.0,
+            "total_seconds": 0.0,
+            "result_text": None,
+            "result_json": None,
+        }
+
+    thread = threading.Thread(target=_run_job, args=(job_id, temp_path, file.filename), daemon=True)
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
+
+
 @app.get("/")
 def health_check():
     return {"status": "ok", "model": "base.en", "device": "cpu"}
@@ -248,9 +276,6 @@ def ui():
 
           <button id=\"submit-btn\" type=\"submit\">Transcribe</button>
         </div>
-        <div class=\"row\">
-          <input id=\"api-key\" name=\"api_key\" type=\"password\" placeholder=\"Optional API key (X-API-Key)\" />
-        </div>
       </form>
 
       <p id=\"status\" class=\"statusline\"></p>
@@ -310,9 +335,7 @@ def ui():
 
       const tick = async () => {
         try {
-          const apiKeyValue = document.getElementById('api-key').value.trim();
-          const headers = apiKeyValue ? { 'X-API-Key': apiKeyValue } : {};
-          const res = await fetch(`/jobs/${jobId}`, { headers });
+          const res = await fetch(`/ui/jobs/${jobId}`);
           if (!res.ok) {
             throw new Error(`Status ${res.status}`);
           }
@@ -389,15 +412,11 @@ def ui():
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
       formData.append('response_format', format);
-      const apiKeyValue = document.getElementById('api-key').value.trim();
 
       status.textContent = 'Uploading file...';
 
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/transcribe-jobs');
-      if (apiKeyValue) {
-        xhr.setRequestHeader('X-API-Key', apiKeyValue);
-      }
+      xhr.open('POST', '/ui/transcribe-jobs');
 
       xhr.upload.onprogress = (ev) => {
         if (ev.lengthComputable) {
@@ -460,32 +479,14 @@ async def create_transcription_job(
     response_format: str = Form("text"),
     _: None = Depends(require_api_key),
 ):
-    suffix = Path(file.filename or "audio").suffix or ".audio"
+    return await _create_job(file, response_format)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
-        temp_path = Path(temp.name)
-        temp.write(await file.read())
-
-    job_id = uuid.uuid4().hex
-
-    with jobs_lock:
-        jobs[job_id] = {
-            "id": job_id,
-            "status": "queued",
-            "progress": 0.0,
-            "message": "Queued",
-            "filename": file.filename,
-            "response_format": response_format,
-            "processed_seconds": 0.0,
-            "total_seconds": 0.0,
-            "result_text": None,
-            "result_json": None,
-        }
-
-    thread = threading.Thread(target=_run_job, args=(job_id, temp_path, file.filename), daemon=True)
-    thread.start()
-
-    return {"job_id": job_id, "status": "queued"}
+@app.post("/ui/transcribe-jobs")
+async def create_ui_transcription_job(
+    file: UploadFile = File(...),
+    response_format: str = Form("text"),
+):
+    return await _create_job(file, response_format)
 
 
 @app.get("/jobs/{job_id}")
@@ -493,6 +494,15 @@ def get_job_status(
     job_id: str,
     _: None = Depends(require_api_key),
 ):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return dict(job)
+
+
+@app.get("/ui/jobs/{job_id}")
+def get_ui_job_status(job_id: str):
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
