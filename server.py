@@ -306,6 +306,7 @@ def ui():
 
           <button id=\"submit-btn\" type=\"submit\">Transcribe</button>
           <button id=\"cancel-btn\" class=\"cancel-button\" type=\"button\" disabled>Cancel</button>
+          <button id=\"reset-btn\" type=\"button\">Reset</button>
         </div>
       </form>
 
@@ -336,6 +337,7 @@ def ui():
     const result = document.getElementById('result');
     const submitBtn = document.getElementById('submit-btn');
     const cancelBtn = document.getElementById('cancel-btn');
+    const resetBtn = document.getElementById('reset-btn');
     const downloadTextBtn = document.getElementById('download-text-btn');
     const downloadJsonBtn = document.getElementById('download-json-btn');
     const uploadBar = document.getElementById('upload-bar');
@@ -579,6 +581,25 @@ def ui():
       xhr.send(formData);
     });
 
+    function resetForm() {
+      if (activeXhr && activeXhr.readyState !== XMLHttpRequest.DONE) {
+        activeXhr.abort();
+      }
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (activeJobId) {
+        fetch(`/ui/jobs/${activeJobId}/cancel`, { method: 'POST' }).catch(() => {});
+      }
+      form.reset();
+      result.textContent = '';
+      status.textContent = '';
+      transcribeBar.classList.remove('busy');
+      resetProgress();
+      submitBtn.disabled = false;
+    }
+
     cancelBtn.addEventListener('click', async () => {
       cancelBtn.disabled = true;
 
@@ -609,6 +630,8 @@ def ui():
       status.textContent = 'Cancel requested.';
       submitBtn.disabled = false;
     });
+
+    resetBtn.addEventListener('click', resetForm);
 
     downloadTextBtn.addEventListener('click', () => {
       if (!lastResultText) {
