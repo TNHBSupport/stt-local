@@ -249,6 +249,7 @@ def ui():
     .statusline { margin: 10px 0 0; color: var(--muted); font-size: 14px; min-height: 20px; }
     .progress-wrap { margin-top: 14px; }
     .progress-label { font-size: 13px; color: var(--muted); margin-bottom: 6px; display: flex; justify-content: space-between; }
+    .download-actions { display: flex; gap: 10px; margin-top: 14px; }
     .progress {
       width: 100%;
       height: 12px;
@@ -282,6 +283,7 @@ def ui():
     }
     @media (max-width: 760px) {
       .grid { grid-template-columns: 1fr; }
+      .download-actions { flex-direction: column; }
       button { width: 100%; }
     }
   </style>
@@ -319,6 +321,11 @@ def ui():
         <div class=\"progress\"><div id=\"transcribe-bar\" class=\"bar\"></div></div>
       </div>
 
+      <div class=\"download-actions\">
+        <button id=\"download-text-btn\" type=\"button\" disabled>Download TXT</button>
+        <button id=\"download-json-btn\" type=\"button\" disabled>Download JSON</button>
+      </div>
+
       <pre id=\"result\"></pre>
     </div>
   </div>
@@ -329,6 +336,8 @@ def ui():
     const result = document.getElementById('result');
     const submitBtn = document.getElementById('submit-btn');
     const cancelBtn = document.getElementById('cancel-btn');
+    const downloadTextBtn = document.getElementById('download-text-btn');
+    const downloadJsonBtn = document.getElementById('download-json-btn');
     const uploadBar = document.getElementById('upload-bar');
     const uploadPct = document.getElementById('upload-pct');
     const transcribeBar = document.getElementById('transcribe-bar');
@@ -337,6 +346,9 @@ def ui():
     let pollTimer = null;
     let activeXhr = null;
     let activeJobId = null;
+    let lastResultText = '';
+    let lastResultJson = null;
+    let lastResultBaseName = 'transcript';
 
     function setUploadProgress(pct) {
       const clamped = Math.max(0, Math.min(100, pct));
@@ -360,7 +372,30 @@ def ui():
       }
       activeXhr = null;
       activeJobId = null;
+      lastResultText = '';
+      lastResultJson = null;
+      lastResultBaseName = 'transcript';
       cancelBtn.disabled = true;
+      downloadTextBtn.disabled = true;
+      downloadJsonBtn.disabled = true;
+    }
+
+    function safeBaseName(filename) {
+      const rawName = filename || 'transcript';
+      const withoutExt = rawName.replace(/[.][^/.]+$/, '');
+      return withoutExt.replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'transcript';
+    }
+
+    function downloadBlob(filename, content, type) {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
     }
 
     async function pollJob(jobId, format) {
@@ -398,13 +433,18 @@ def ui():
             setTranscriptionProgress(100);
             status.textContent = 'Done.';
             activeJobId = null;
+            lastResultText = data.result_text || '';
+            lastResultJson = data.result_json || null;
+            lastResultBaseName = safeBaseName(data.filename || (data.result_json && data.result_json.filename));
             if (format === 'json') {
-              result.textContent = JSON.stringify(data.result_json, null, 2);
+              result.textContent = JSON.stringify(lastResultJson, null, 2);
             } else {
-              result.textContent = data.result_text || '';
+              result.textContent = lastResultText;
             }
             submitBtn.disabled = false;
             cancelBtn.disabled = true;
+            downloadTextBtn.disabled = !lastResultText;
+            downloadJsonBtn.disabled = !lastResultJson;
             return;
           }
 
@@ -568,6 +608,24 @@ def ui():
       transcribeBar.classList.remove('busy');
       status.textContent = 'Cancel requested.';
       submitBtn.disabled = false;
+    });
+
+    downloadTextBtn.addEventListener('click', () => {
+      if (!lastResultText) {
+        return;
+      }
+      downloadBlob(`${lastResultBaseName}.txt`, lastResultText, 'text/plain;charset=utf-8');
+    });
+
+    downloadJsonBtn.addEventListener('click', () => {
+      if (!lastResultJson) {
+        return;
+      }
+      downloadBlob(
+        `${lastResultBaseName}.json`,
+        JSON.stringify(lastResultJson, null, 2),
+        'application/json;charset=utf-8'
+      );
     });
   </script>
 </body>
