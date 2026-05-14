@@ -68,6 +68,10 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
         total_seconds = _audio_duration_seconds(temp_path)
 
         with jobs_lock:
+            if jobs[job_id]["status"] == "cancel_requested":
+                jobs[job_id]["status"] = "canceled"
+                jobs[job_id]["message"] = "Transcription canceled"
+                return
             jobs[job_id]["status"] = "transcribing"
             jobs[job_id]["message"] = "Transcribing audio"
             jobs[job_id]["total_seconds"] = total_seconds
@@ -84,6 +88,12 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
         lines = []
 
         for segment in segments:
+            with jobs_lock:
+                if jobs[job_id]["status"] == "cancel_requested":
+                    jobs[job_id]["status"] = "canceled"
+                    jobs[job_id]["message"] = "Transcription canceled"
+                    return
+
             text = segment.text.strip()
             segment_list.append({"start": segment.start, "end": segment.end, "text": text})
             lines.append(f"[{segment.start:.2f} - {segment.end:.2f}] {text}")
@@ -106,6 +116,10 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
         }
 
         with jobs_lock:
+            if jobs[job_id]["status"] == "cancel_requested":
+                jobs[job_id]["status"] = "canceled"
+                jobs[job_id]["message"] = "Transcription canceled"
+                return
             jobs[job_id]["status"] = "done"
             jobs[job_id]["message"] = "Transcription complete"
             jobs[job_id]["progress"] = 100.0
@@ -117,6 +131,18 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
             jobs[job_id]["message"] = str(exc)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _cancel_job(job_id: str) -> dict:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job["status"] in {"done", "error", "canceled"}:
+            return dict(job)
+        job["status"] = "cancel_requested"
+        job["message"] = "Cancel requested"
+        return dict(job)
 
 
 async def _create_job(file: UploadFile, response_format: str) -> dict:
@@ -198,7 +224,7 @@ def ui():
     .grid {
       display: grid;
       gap: 12px;
-      grid-template-columns: 1fr 180px auto;
+      grid-template-columns: 1fr 180px auto auto;
       align-items: center;
     }
     input[type=file], select {
@@ -218,6 +244,7 @@ def ui():
       font-weight: 600;
       cursor: pointer;
     }
+    .cancel-button { background: #d94848; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     .statusline { margin: 10px 0 0; color: var(--muted); font-size: 14px; min-height: 20px; }
     .progress-wrap { margin-top: 14px; }
@@ -276,6 +303,7 @@ def ui():
           </select>
 
           <button id=\"submit-btn\" type=\"submit\">Transcribe</button>
+          <button id=\"cancel-btn\" class=\"cancel-button\" type=\"button\" disabled>Cancel</button>
         </div>
       </form>
 
@@ -300,12 +328,15 @@ def ui():
     const status = document.getElementById('status');
     const result = document.getElementById('result');
     const submitBtn = document.getElementById('submit-btn');
+    const cancelBtn = document.getElementById('cancel-btn');
     const uploadBar = document.getElementById('upload-bar');
     const uploadPct = document.getElementById('upload-pct');
     const transcribeBar = document.getElementById('transcribe-bar');
     const transcribePct = document.getElementById('transcribe-pct');
 
     let pollTimer = null;
+    let activeXhr = null;
+    let activeJobId = null;
 
     function setUploadProgress(pct) {
       const clamped = Math.max(0, Math.min(100, pct));
@@ -327,6 +358,9 @@ def ui():
         clearInterval(pollTimer);
         pollTimer = null;
       }
+      activeXhr = null;
+      activeJobId = null;
+      cancelBtn.disabled = true;
     }
 
     async function pollJob(jobId, format) {
@@ -363,12 +397,26 @@ def ui():
             transcribeBar.classList.remove('busy');
             setTranscriptionProgress(100);
             status.textContent = 'Done.';
+            activeJobId = null;
             if (format === 'json') {
               result.textContent = JSON.stringify(data.result_json, null, 2);
             } else {
               result.textContent = data.result_text || '';
             }
             submitBtn.disabled = false;
+            cancelBtn.disabled = true;
+            return;
+          }
+
+          if (data.status === 'cancel_requested' || data.status === 'canceled') {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            transcribeBar.classList.remove('busy');
+            status.textContent = 'Canceled.';
+            result.textContent = '';
+            activeJobId = null;
+            submitBtn.disabled = false;
+            cancelBtn.disabled = true;
             return;
           }
 
@@ -378,7 +426,9 @@ def ui():
             transcribeBar.classList.remove('busy');
             status.textContent = 'Transcription failed.';
             result.textContent = data.message || 'Unknown error';
+            activeJobId = null;
             submitBtn.disabled = false;
+            cancelBtn.disabled = true;
             return;
           }
         } catch (error) {
@@ -387,7 +437,9 @@ def ui():
           transcribeBar.classList.remove('busy');
           status.textContent = 'Progress check failed.';
           result.textContent = String(error);
+          activeJobId = null;
           submitBtn.disabled = false;
+          cancelBtn.disabled = true;
         }
       };
 
@@ -398,8 +450,9 @@ def ui():
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       result.textContent = '';
-      submitBtn.disabled = true;
       resetProgress();
+      submitBtn.disabled = true;
+      cancelBtn.disabled = false;
 
       const fileInput = document.getElementById('file');
       const format = document.getElementById('format').value;
@@ -407,6 +460,7 @@ def ui():
       if (!fileInput.files.length) {
         status.textContent = 'Choose a file first.';
         submitBtn.disabled = false;
+        cancelBtn.disabled = true;
         return;
       }
 
@@ -417,6 +471,7 @@ def ui():
       status.textContent = 'Uploading file...';
 
       const xhr = new XMLHttpRequest();
+      activeXhr = xhr;
       xhr.open('POST', '/ui/transcribe-jobs');
 
       xhr.upload.onprogress = (ev) => {
@@ -434,14 +489,26 @@ def ui():
       xhr.onerror = () => {
         status.textContent = 'Upload failed.';
         result.textContent = 'Network error while uploading file.';
+        activeXhr = null;
         submitBtn.disabled = false;
+        cancelBtn.disabled = true;
+      };
+
+      xhr.onabort = () => {
+        status.textContent = 'Upload canceled.';
+        result.textContent = '';
+        activeXhr = null;
+        submitBtn.disabled = false;
+        cancelBtn.disabled = true;
       };
 
       xhr.onload = async () => {
+        activeXhr = null;
         if (xhr.status < 200 || xhr.status >= 300) {
           status.textContent = `Request failed: ${xhr.status}`;
           result.textContent = xhr.responseText;
           submitBtn.disabled = false;
+          cancelBtn.disabled = true;
           return;
         }
 
@@ -452,6 +519,7 @@ def ui():
           status.textContent = 'Could not parse server response.';
           result.textContent = String(error);
           submitBtn.disabled = false;
+          cancelBtn.disabled = true;
           return;
         }
 
@@ -459,14 +527,47 @@ def ui():
           status.textContent = 'Server did not return a job id.';
           result.textContent = xhr.responseText;
           submitBtn.disabled = false;
+          cancelBtn.disabled = true;
           return;
         }
 
+        activeJobId = payload.job_id;
         status.textContent = 'Transcribing audio...';
         await pollJob(payload.job_id, format);
       };
 
       xhr.send(formData);
+    });
+
+    cancelBtn.addEventListener('click', async () => {
+      cancelBtn.disabled = true;
+
+      if (activeXhr && activeXhr.readyState !== XMLHttpRequest.DONE) {
+        activeXhr.abort();
+        return;
+      }
+
+      if (!activeJobId) {
+        submitBtn.disabled = false;
+        status.textContent = 'Canceled.';
+        return;
+      }
+
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+
+      try {
+        await fetch(`/ui/jobs/${activeJobId}/cancel`, { method: 'POST' });
+      } catch (error) {
+        result.textContent = String(error);
+      }
+
+      activeJobId = null;
+      transcribeBar.classList.remove('busy');
+      status.textContent = 'Cancel requested.';
+      submitBtn.disabled = false;
     });
   </script>
 </body>
@@ -502,6 +603,14 @@ def get_job_status(
         return dict(job)
 
 
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(
+    job_id: str,
+    _: None = Depends(require_api_key),
+):
+    return _cancel_job(job_id)
+
+
 @app.get("/ui/jobs/{job_id}")
 def get_ui_job_status(job_id: str):
     with jobs_lock:
@@ -509,6 +618,11 @@ def get_ui_job_status(job_id: str):
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return dict(job)
+
+
+@app.post("/ui/jobs/{job_id}/cancel")
+def cancel_ui_job(job_id: str):
+    return _cancel_job(job_id)
 
 
 @app.post("/transcribe")
