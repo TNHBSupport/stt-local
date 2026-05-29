@@ -1,4 +1,5 @@
 .venv/
+transcripts_history/
 __pycache__/
 *.pyc
 *.pyo
