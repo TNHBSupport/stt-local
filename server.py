@@ -1114,7 +1114,6 @@ async def create_ui_transcription_job(
 def transcribe_url(
     url: str = Form(...),
     response_format: str = Form("json"),
-    _: None = Depends(require_api_key),
 ):
     text_output, json_output = _fetch_url_transcript(url)
     return _format_transcript_response(text_output, json_output, response_format)
