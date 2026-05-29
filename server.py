@@ -3,6 +3,8 @@ import threading
 import uuid
 import os
 import json
+import html
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -12,6 +14,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Query, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from faster_whisper import WhisperModel
+from yt_dlp import YoutubeDL
 
 app = FastAPI(title="Local Speech-to-Text API")
 
@@ -265,6 +268,123 @@ async def _create_job(file: UploadFile, response_format: str) -> dict:
     thread = threading.Thread(target=_run_job, args=(job_id, temp_path, file.filename), daemon=True)
     thread.start()
     return {"job_id": job_id, "status": "queued"}
+
+
+def _format_transcript_response(text_output: str, json_output: dict, response_format: str):
+    if response_format == "json":
+        return JSONResponse(json_output)
+    return PlainTextResponse(text_output)
+
+
+def _vtt_timestamp_to_seconds(value: str) -> float:
+    parts = value.strip().replace(",", ".").split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = parts
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        if len(parts) == 2:
+            minutes, seconds = parts
+            return int(minutes) * 60 + float(seconds)
+    except ValueError:
+        return 0.0
+    return 0.0
+
+
+def _parse_vtt(vtt_text: str) -> list[dict]:
+    segments = []
+    lines = vtt_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "-->" not in line:
+            i += 1
+            continue
+
+        start_raw, end_raw = [part.strip().split(" ")[0] for part in line.split("-->", 1)]
+        start = _vtt_timestamp_to_seconds(start_raw)
+        end = _vtt_timestamp_to_seconds(end_raw)
+        i += 1
+
+        text_lines = []
+        while i < len(lines) and lines[i].strip() != "":
+            text = re.sub(r"<[^>]+>", "", lines[i].strip())
+            text = html.unescape(text)
+            if text:
+                text_lines.append(text)
+            i += 1
+
+        text = " ".join(text_lines).strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+        i += 1
+
+    return segments
+
+
+def _select_caption_track(info: dict) -> tuple[str, dict] | tuple[None, None]:
+    tracks_by_lang = {}
+    for source_key in ("subtitles", "automatic_captions"):
+        source = info.get(source_key) or {}
+        if isinstance(source, dict):
+            tracks_by_lang.update(source)
+
+    if not tracks_by_lang:
+        return None, None
+
+    language_order = ["en", "en-US", "en-us", "en-x-autogen"]
+    language_order.extend(lang for lang in tracks_by_lang if str(lang).lower().startswith("en"))
+
+    seen = set()
+    for language in language_order:
+        if language in seen or language not in tracks_by_lang:
+            continue
+        seen.add(language)
+        tracks = tracks_by_lang.get(language) or []
+        for track in tracks:
+            protocol = (track.get("protocol") or "").lower() if isinstance(track, dict) else ""
+            url = str(track.get("url") or "") if isinstance(track, dict) else ""
+            if (
+                isinstance(track, dict)
+                and url
+                and (track.get("ext") or "").lower() == "vtt"
+                and protocol != "m3u8_native"
+                and ".vtt" in url
+            ):
+                return language, track
+        for track in tracks:
+            if isinstance(track, dict) and track.get("url"):
+                return language, track
+
+    return None, None
+
+
+def _fetch_url_transcript(url: str) -> tuple[str, dict]:
+    with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+        language, track = _select_caption_track(info)
+        if not track:
+            raise HTTPException(status_code=404, detail="No Vimeo subtitles/transcript track found for this URL")
+
+        response = ydl.urlopen(str(track["url"]))
+        vtt_text = response.read().decode("utf-8", errors="replace")
+
+    segments = _parse_vtt(vtt_text)
+    if not segments:
+        raise HTTPException(status_code=422, detail="Subtitle track was found but could not be parsed")
+
+    title = str(info.get("title") or info.get("id") or "vimeo-transcript")
+    text_output = "\n".join(f"[{item['start']:.2f} - {item['end']:.2f}] {item['text']}" for item in segments)
+    json_output = {
+        "filename": title,
+        "source_url": url,
+        "source": "vimeo_captions",
+        "language": language,
+        "segments": segments,
+        "text": " ".join(item["text"] for item in segments),
+    }
+    _persist_history(title, text_output, json_output)
+    return text_output, json_output
 
 
 @app.get("/")
@@ -988,6 +1108,25 @@ async def create_ui_transcription_job(
     response_format: str = Form("text"),
 ):
     return await _create_job(file, response_format)
+
+
+@app.post("/transcribe-url")
+def transcribe_url(
+    url: str = Form(...),
+    response_format: str = Form("json"),
+    _: None = Depends(require_api_key),
+):
+    text_output, json_output = _fetch_url_transcript(url)
+    return _format_transcript_response(text_output, json_output, response_format)
+
+
+@app.post("/ui/transcribe-url")
+def transcribe_ui_url(
+    url: str = Form(...),
+    response_format: str = Form("json"),
+):
+    text_output, json_output = _fetch_url_transcript(url)
+    return _format_transcript_response(text_output, json_output, response_format)
 
 
 @app.get("/jobs/{job_id}")
