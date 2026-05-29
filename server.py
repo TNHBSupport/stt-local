@@ -449,7 +449,8 @@ def ui():
       grid-template-columns: 1fr auto auto;
       align-items: center;
     }
-    input[type=file] {
+    input[type=file],
+    input[type=url] {
       width: 100%;
       border: 1px solid var(--border);
       background: #fafdff;
@@ -579,6 +580,14 @@ def ui():
         </div>
       </form>
 
+      <form id=\"url-form\">
+        <div class=\"row grid\">
+          <input id=\"source-url\" name=\"url\" type=\"url\" placeholder=\"Paste Vimeo URL\" />
+          <button id=\"url-submit-btn\" type=\"submit\">Fetch Transcript</button>
+          <span></span>
+        </div>
+      </form>
+
       <p id=\"status\" class=\"statusline\"></p>
 
       <div id=\"upload-progress-wrap\" class=\"progress-wrap hidden\">
@@ -621,9 +630,11 @@ def ui():
 
   <script>
     const form = document.getElementById('upload-form');
+    const urlForm = document.getElementById('url-form');
     const status = document.getElementById('status');
     const result = document.getElementById('result');
     const submitBtn = document.getElementById('submit-btn');
+    const urlSubmitBtn = document.getElementById('url-submit-btn');
     const cancelBtn = document.getElementById('cancel-btn');
     const resetBtn = document.getElementById('reset-btn');
     const downloadTextBtn = document.getElementById('download-text-btn');
@@ -765,6 +776,7 @@ def ui():
       lastResultJson = null;
       lastResultBaseName = 'transcript';
       cancelBtn.disabled = true;
+      urlSubmitBtn.disabled = false;
       downloadTextBtn.disabled = true;
       downloadJsonBtn.disabled = true;
       uploadProgressWrap.classList.add('hidden');
@@ -831,6 +843,7 @@ def ui():
             lastResultBaseName = safeBaseName(data.filename || (data.result_json && data.result_json.filename));
             result.textContent = lastResultText;
             submitBtn.disabled = false;
+            urlSubmitBtn.disabled = false;
             cancelBtn.disabled = true;
             downloadTextBtn.disabled = !lastResultText;
             downloadJsonBtn.disabled = !lastResultJson;
@@ -847,6 +860,7 @@ def ui():
             result.textContent = '';
             activeJobId = null;
             submitBtn.disabled = false;
+            urlSubmitBtn.disabled = false;
             cancelBtn.disabled = true;
             return;
           }
@@ -859,6 +873,7 @@ def ui():
             result.textContent = data.message || 'Unknown error';
             activeJobId = null;
             submitBtn.disabled = false;
+            urlSubmitBtn.disabled = false;
             cancelBtn.disabled = true;
             return;
           }
@@ -870,6 +885,7 @@ def ui():
           result.textContent = String(error);
           activeJobId = null;
           submitBtn.disabled = false;
+          urlSubmitBtn.disabled = false;
           cancelBtn.disabled = true;
         }
       };
@@ -883,6 +899,7 @@ def ui():
       result.textContent = '';
       resetProgress();
       submitBtn.disabled = true;
+      urlSubmitBtn.disabled = true;
       cancelBtn.disabled = false;
 
       const fileInput = document.getElementById('file');
@@ -891,6 +908,7 @@ def ui():
       if (!fileInput.files.length) {
         status.textContent = 'Choose a file first.';
         submitBtn.disabled = false;
+        urlSubmitBtn.disabled = false;
         cancelBtn.disabled = true;
         return;
       }
@@ -924,6 +942,7 @@ def ui():
         result.textContent = 'Network error while uploading file.';
         activeXhr = null;
         submitBtn.disabled = false;
+        urlSubmitBtn.disabled = false;
         cancelBtn.disabled = true;
       };
 
@@ -932,6 +951,7 @@ def ui():
         result.textContent = '';
         activeXhr = null;
         submitBtn.disabled = false;
+        urlSubmitBtn.disabled = false;
         cancelBtn.disabled = true;
       };
 
@@ -941,6 +961,7 @@ def ui():
           status.textContent = `Request failed: ${xhr.status}`;
           result.textContent = xhr.responseText;
           submitBtn.disabled = false;
+          urlSubmitBtn.disabled = false;
           cancelBtn.disabled = true;
           return;
         }
@@ -952,6 +973,7 @@ def ui():
           status.textContent = 'Could not parse server response.';
           result.textContent = String(error);
           submitBtn.disabled = false;
+          urlSubmitBtn.disabled = false;
           cancelBtn.disabled = true;
           return;
         }
@@ -960,6 +982,7 @@ def ui():
           status.textContent = 'Server did not return a job id.';
           result.textContent = xhr.responseText;
           submitBtn.disabled = false;
+          urlSubmitBtn.disabled = false;
           cancelBtn.disabled = true;
           return;
         }
@@ -970,6 +993,59 @@ def ui():
       };
 
       xhr.send(formData);
+    });
+
+    urlForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      result.textContent = '';
+      resetProgress();
+      submitBtn.disabled = true;
+      urlSubmitBtn.disabled = true;
+      cancelBtn.disabled = true;
+      status.textContent = 'Fetching transcript from URL...';
+
+      const urlInput = document.getElementById('source-url');
+      const sourceUrl = (urlInput.value || '').trim();
+      if (!sourceUrl) {
+        status.textContent = 'Paste a Vimeo URL first.';
+        submitBtn.disabled = false;
+        urlSubmitBtn.disabled = false;
+        return;
+      }
+
+      try {
+        const formData = new FormData();
+        formData.append('url', sourceUrl);
+        formData.append('response_format', 'json');
+
+        const res = await fetch('/ui/transcribe-url', {
+          method: 'POST',
+          body: formData,
+        });
+        const payload = await res.json();
+        if (!res.ok) {
+          throw new Error(payload.detail || `Request failed (${res.status})`);
+        }
+
+        lastResultJson = payload;
+        lastResultText = Array.isArray(payload.segments)
+          ? payload.segments.map((item) => `[${Number(item.start || 0).toFixed(2)} - ${Number(item.end || 0).toFixed(2)}] ${item.text || ''}`).join('\\n')
+          : (payload.text || '');
+        lastResultBaseName = safeBaseName(payload.filename || 'vimeo-transcript');
+        result.textContent = lastResultText;
+        status.textContent = 'Transcript fetched.';
+        downloadTextBtn.disabled = !lastResultText;
+        downloadJsonBtn.disabled = !lastResultJson;
+        downloadActions.classList.remove('hidden');
+        setActiveTab('result');
+        refreshHistory().catch(() => {});
+      } catch (error) {
+        status.textContent = 'URL transcript fetch failed.';
+        result.textContent = String(error);
+      } finally {
+        submitBtn.disabled = false;
+        urlSubmitBtn.disabled = false;
+      }
     });
 
     function resetForm() {
@@ -989,6 +1065,7 @@ def ui():
       transcribeBar.classList.remove('busy');
       resetProgress();
       submitBtn.disabled = false;
+      urlSubmitBtn.disabled = false;
     }
 
     cancelBtn.addEventListener('click', async () => {
@@ -1001,6 +1078,7 @@ def ui():
 
       if (!activeJobId) {
         submitBtn.disabled = false;
+        urlSubmitBtn.disabled = false;
         status.textContent = 'Canceled.';
         return;
       }
@@ -1020,6 +1098,7 @@ def ui():
       transcribeBar.classList.remove('busy');
       status.textContent = 'Cancel requested.';
       submitBtn.disabled = false;
+      urlSubmitBtn.disabled = false;
     });
 
     resetBtn.addEventListener('click', resetForm);
