@@ -37,7 +37,13 @@ cd "${CURRENT_DIR}"
 nohup "${VENV_DIR}/bin/uvicorn" server:app --host "${HOST}" --port "${PORT}" > "${LOG_FILE}" 2>&1 &
 echo "$!" > "${PID_FILE}"
 
-sleep 2
-curl -fsS "http://${HOST}:${PORT}/" >/dev/null
+for attempt in $(seq 1 15); do
+  if curl -fsS "http://${HOST}:${PORT}/" >/dev/null 2>&1; then
+    echo "STT server restarted on ${HOST}:${PORT}"
+    exit 0
+  fi
+  sleep 2
+done
 
-echo "STT server restarted on ${HOST}:${PORT}"
+echo "STT server failed to respond on ${HOST}:${PORT} after deploy" >&2
+exit 1
