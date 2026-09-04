@@ -7,6 +7,8 @@ import os
 import json
 import html
 import re
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -30,6 +32,9 @@ HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE_PATH = Path(os.getenv("STT_LOG_FILE", "../uvicorn.log"))
 LOG_TAIL_MAX_BYTES = 200_000
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+# ~9 min pieces so Whisper/VAD never holds a 45+ min decode in RAM.
+CHUNK_SECONDS = 540
+CHUNK_IF_UNKNOWN_SIZE_BYTES = 20 * 1024 * 1024
 
 
 class ImmediateFileHandler(logging.FileHandler):
@@ -309,9 +314,124 @@ def _audio_duration_seconds(path: Path) -> float:
     return 0.0
 
 
+def _job_canceled(job_id: str) -> bool:
+    with jobs_lock:
+        if jobs[job_id]["status"] != "cancel_requested":
+            return False
+        jobs[job_id]["status"] = "canceled"
+        jobs[job_id]["message"] = "Transcription canceled"
+        return True
+
+
+def _try_split_audio_chunks(src: Path, chunk_seconds: int = CHUNK_SECONDS) -> list[Path] | None:
+    """Split with ffmpeg into ~chunk_seconds wavs. None means use the original file."""
+    chunk_dir = Path(tempfile.mkdtemp(prefix="stt-chunks-"))
+    pattern = str(chunk_dir / "chunk_%03d.wav")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-reset_timestamps",
+        "1",
+        pattern,
+    ]
+    try:
+        completed = subprocess.run(cmd, check=False, capture_output=True, timeout=600)
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ffmpeg split failed: %s", exc)
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        return None
+    if completed.returncode != 0:
+        stderr = (completed.stderr or b"").decode("utf-8", errors="replace")[:500]
+        logger.warning("ffmpeg split failed rc=%s stderr=%s", completed.returncode, stderr)
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        return None
+    chunks = sorted(chunk_dir.glob("chunk_*.wav"))
+    if len(chunks) < 2:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        return None
+    return chunks
+
+
+def _transcribe_file(
+    audio_path: Path,
+    job_id: str,
+    time_offset: float,
+    total_seconds: float,
+    segment_list: list,
+    lines: list,
+    last_progress_bucket: int,
+):
+    """Run the existing Whisper model on one file. None means the job was canceled."""
+    segments, info = model.transcribe(
+        str(audio_path),
+        language="en",
+        beam_size=1,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
+
+    for segment in segments:
+        if _job_canceled(job_id):
+            return None
+
+        start = float(segment.start) + time_offset
+        end = float(segment.end) + time_offset
+        text = segment.text.strip()
+        segment_list.append({"start": start, "end": end, "text": text})
+        lines.append(f"[{start:.2f} - {end:.2f}] {text}")
+
+        if total_seconds > 0:
+            pct = min(99.0, max(0.0, (end / total_seconds) * 100))
+        else:
+            pct = min(99.0, len(segment_list) * 2.0)
+
+        with jobs_lock:
+            jobs[job_id]["progress"] = pct
+            jobs[job_id]["processed_seconds"] = end
+
+        bucket = int(pct // 10)
+        if bucket > last_progress_bucket:
+            last_progress_bucket = bucket
+            logger.info(
+                "Job %s progress=%.0f%% processed_s=%.1f total_s=%.1f segments=%s",
+                job_id,
+                pct,
+                end,
+                total_seconds,
+                len(segment_list),
+            )
+        elif total_seconds <= 0 and len(segment_list) % 25 == 0:
+            logger.info(
+                "Job %s progress=%.0f%% processed_s=%.1f segments=%s",
+                job_id,
+                pct,
+                end,
+                len(segment_list),
+            )
+
+    return info, last_progress_bucket
+
+
 def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
     _lower_thread_priority()
     file_size = temp_path.stat().st_size if temp_path.exists() else 0
+    chunk_dir = None
     try:
         total_seconds = _audio_duration_seconds(temp_path)
         logger.info(
@@ -332,62 +452,80 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
             jobs[job_id]["message"] = "Transcribing audio"
             jobs[job_id]["total_seconds"] = total_seconds
 
-        segments, info = model.transcribe(
-            str(temp_path),
-            language="en",
-            beam_size=1,
-            vad_filter=True,
-            condition_on_previous_text=False,
+        should_chunk = total_seconds > CHUNK_SECONDS or (
+            total_seconds <= 0 and file_size > CHUNK_IF_UNKNOWN_SIZE_BYTES
         )
+        chunks: list[Path] | None = None
+        if should_chunk:
+            with jobs_lock:
+                jobs[job_id]["message"] = "Splitting audio into chunks"
+                jobs[job_id]["progress"] = 1.0
+            chunks = _try_split_audio_chunks(temp_path)
+            if chunks:
+                chunk_dir = chunks[0].parent
+                logger.info(
+                    "Job %s split into %s chunks of ~%ss",
+                    job_id,
+                    len(chunks),
+                    CHUNK_SECONDS,
+                )
+            else:
+                logger.warning("Job %s ffmpeg split failed; transcribing full file", job_id)
+                with jobs_lock:
+                    jobs[job_id]["message"] = "Transcribing audio"
 
+        work_paths = chunks if chunks else [temp_path]
+        chunk_count = len(work_paths)
         segment_list = []
         lines = []
         last_progress_bucket = 0
+        time_offset = 0.0
+        info = None
 
-        for segment in segments:
-            with jobs_lock:
-                if jobs[job_id]["status"] == "cancel_requested":
-                    jobs[job_id]["status"] = "canceled"
-                    jobs[job_id]["message"] = "Transcription canceled"
-                    return
+        for index, audio_path in enumerate(work_paths):
+            if _job_canceled(job_id):
+                logger.info("Job %s canceled before chunk %s", job_id, index + 1)
+                return
 
-            text = segment.text.strip()
-            segment_list.append({"start": segment.start, "end": segment.end, "text": text})
-            lines.append(f"[{segment.start:.2f} - {segment.end:.2f}] {text}")
-
-            if total_seconds > 0:
-                pct = min(99.0, max(0.0, (segment.end / total_seconds) * 100))
-            else:
-                pct = min(99.0, len(segment_list) * 2.0)
-
-            with jobs_lock:
-                jobs[job_id]["progress"] = pct
-                jobs[job_id]["processed_seconds"] = segment.end
-
-            bucket = int(pct // 10)
-            if bucket > last_progress_bucket:
-                last_progress_bucket = bucket
+            if chunk_count > 1:
+                if total_seconds > 0:
+                    floor = min(99.0, max(1.0, (time_offset / total_seconds) * 100))
+                else:
+                    floor = min(99.0, max(1.0, (index / chunk_count) * 100))
+                with jobs_lock:
+                    jobs[job_id]["message"] = f"Transcribing chunk {index + 1}/{chunk_count}"
+                    jobs[job_id]["progress"] = floor
+                    jobs[job_id]["processed_seconds"] = time_offset
                 logger.info(
-                    "Job %s progress=%.0f%% processed_s=%.1f total_s=%.1f segments=%s",
+                    "Job %s chunk %s/%s offset_s=%.1f",
                     job_id,
-                    pct,
-                    segment.end,
-                    total_seconds,
-                    len(segment_list),
-                )
-            elif total_seconds <= 0 and len(segment_list) % 25 == 0:
-                logger.info(
-                    "Job %s progress=%.0f%% processed_s=%.1f segments=%s",
-                    job_id,
-                    pct,
-                    segment.end,
-                    len(segment_list),
+                    index + 1,
+                    chunk_count,
+                    time_offset,
                 )
 
+            result = _transcribe_file(
+                audio_path,
+                job_id,
+                time_offset,
+                total_seconds,
+                segment_list,
+                lines,
+                last_progress_bucket,
+            )
+            if result is None:
+                logger.info("Job %s canceled during chunk %s", job_id, index + 1)
+                return
+            info, last_progress_bucket = result
+            if chunk_count > 1:
+                chunk_dur = _audio_duration_seconds(audio_path)
+                time_offset += chunk_dur if chunk_dur > 0 else float(CHUNK_SECONDS)
+
+        language = info.language if info is not None else "en"
         text_output = "\n".join(lines)
         json_output = {
             "filename": original_name,
-            "language": info.language,
+            "language": language,
             "segments": segment_list,
             "text": " ".join(item["text"] for item in segment_list),
         }
@@ -411,6 +549,8 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["message"] = str(exc)
     finally:
+        if chunk_dir is not None:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
         temp_path.unlink(missing_ok=True)
 
 

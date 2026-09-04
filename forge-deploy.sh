@@ -41,13 +41,36 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export CT2_USE_EXPERIMENTAL_PACKED_GEMM="${CT2_USE_EXPERIMENTAL_PACKED_GEMM:-0}"
 
 cd "${CURRENT_DIR}"
-# Line-buffer logs so the UI log tab is not empty if the process is killed (OOM/502).
+# Respawn uvicorn after crash (OOM) so Cloudflare is not stuck on 502 until the next deploy.
+# PID file stores this wrapper; deploy stop still kill "$(cat PID_FILE)" then pkill uvicorn.
 nohup env PYTHONUNBUFFERED=1 STT_LOG_FILE="${STT_LOG_FILE}" \
   OMP_NUM_THREADS="${OMP_NUM_THREADS}" \
   OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS}" \
   MKL_NUM_THREADS="${MKL_NUM_THREADS}" \
   CT2_USE_EXPERIMENTAL_PACKED_GEMM="${CT2_USE_EXPERIMENTAL_PACKED_GEMM}" \
-  "${VENV_DIR}/bin/uvicorn" server:app --host "${HOST}" --port "${PORT}" --timeout-keep-alive 75 \
+  bash -c '
+    child=""
+    stopping=0
+    shutdown() {
+      stopping=1
+      if [ -n "${child}" ]; then
+        kill "${child}" 2>/dev/null || true
+        wait "${child}" 2>/dev/null || true
+      fi
+      exit 0
+    }
+    trap shutdown TERM INT
+    while [ "${stopping}" -eq 0 ]; do
+      "$@" &
+      child=$!
+      wait "${child}" || true
+      child=""
+      if [ "${stopping}" -eq 0 ]; then
+        echo "uvicorn exited, restarting in 2s" >&2
+        sleep 2
+      fi
+    done
+  ' _ "${VENV_DIR}/bin/uvicorn" server:app --host "${HOST}" --port "${PORT}" --timeout-keep-alive 75 \
   > "${LOG_FILE}" 2>&1 &
 echo "$!" > "${PID_FILE}"
 
