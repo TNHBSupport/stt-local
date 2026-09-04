@@ -807,12 +807,17 @@ def ui():
         clearInterval(pollTimer);
       }
 
+      const MAX_CONSECUTIVE_POLL_FAILURES = 8;
+      let consecutivePollFailures = 0;
+
       const tick = async () => {
         try {
           const res = await fetch(`/ui/jobs/${jobId}`);
           if (!res.ok) {
             throw new Error(`Status ${res.status}`);
           }
+
+          consecutivePollFailures = 0;
 
           const data = await res.json();
           if (typeof data.progress === 'number') {
@@ -878,15 +883,22 @@ def ui():
             return;
           }
         } catch (error) {
+          consecutivePollFailures += 1;
+          if (consecutivePollFailures < MAX_CONSECUTIVE_POLL_FAILURES) {
+            status.textContent = `Progress check failed, retrying... (${error})`;
+            return;
+          }
+
           clearInterval(pollTimer);
           pollTimer = null;
           transcribeBar.classList.remove('busy');
-          status.textContent = 'Progress check failed.';
+          status.textContent = 'Progress check failed. The job may still finish in the background — check History shortly.';
           result.textContent = String(error);
           activeJobId = null;
           submitBtn.disabled = false;
           urlSubmitBtn.disabled = false;
           cancelBtn.disabled = true;
+          refreshHistory().catch(() => {});
         }
       };
 
