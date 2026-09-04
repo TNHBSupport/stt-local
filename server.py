@@ -1,3 +1,5 @@
+import logging
+import sys
 import tempfile
 import threading
 import uuid
@@ -10,11 +12,82 @@ from pathlib import Path
 from typing import Annotated
 
 import av
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Header, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from faster_whisper import WhisperModel
 from yt_dlp import YoutubeDL
+
+HISTORY_DIR = Path("transcripts_history")
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE_PATH = Path(os.getenv("STT_LOG_FILE", "../uvicorn.log"))
+LOG_TAIL_MAX_BYTES = 200_000
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+class ImmediateFileHandler(logging.FileHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
+
+class ImmediateStreamHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
+
+def _setup_logging() -> logging.Logger:
+    logger = logging.getLogger("stt")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    try:
+        LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = ImmediateFileHandler(LOG_FILE_PATH, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        sys.stderr.write(f"Could not attach STT log file {LOG_FILE_PATH}: {exc}\n")
+    if sys.stdout.isatty():
+        stream_handler = ImmediateStreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    return logger
+
+
+logger = _setup_logging()
+
+
+class RequestLogMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            content_length = "-"
+            for key, value in scope.get("headers", []):
+                if key == b"content-length":
+                    content_length = value.decode("latin-1")
+                    break
+            method = scope.get("method")
+            path = scope.get("path") or ""
+            skip_poll = method == "GET" and (
+                path == "/ui/logs"
+                or path.startswith("/ui/jobs/")
+                or path.startswith("/jobs/")
+            )
+            if not skip_poll:
+                logger.info(
+                    "Incoming %s %s content-length=%s",
+                    method,
+                    path,
+                    content_length,
+                )
+        await self.app(scope, receive, send)
+
 
 app = FastAPI(title="Local Speech-to-Text API")
 
@@ -35,7 +108,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLogMiddleware)
 
+logger.info("Loading Whisper model base.en (cpu/int8)...")
 model = WhisperModel(
     "base.en",
     device="cpu",
@@ -43,15 +118,11 @@ model = WhisperModel(
     cpu_threads=2,
     num_workers=1,
 )
+logger.info("Whisper model ready")
 
 jobs = {}
 jobs_lock = threading.Lock()
 history_lock = threading.Lock()
-UPLOAD_CHUNK_SIZE = 1024 * 1024
-HISTORY_DIR = Path("transcripts_history")
-HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE_PATH = Path(os.getenv("STT_LOG_FILE", "../uvicorn.log"))
-LOG_TAIL_MAX_BYTES = 200_000
 
 
 def _safe_base_name(filename: str | None) -> str:
@@ -166,13 +237,22 @@ def _audio_duration_seconds(path: Path) -> float:
 
 
 def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
+    file_size = temp_path.stat().st_size if temp_path.exists() else 0
     try:
         total_seconds = _audio_duration_seconds(temp_path)
+        logger.info(
+            "Job %s starting file=%s size_mb=%.1f duration_s=%.1f",
+            job_id,
+            original_name,
+            file_size / (1024 * 1024),
+            total_seconds,
+        )
 
         with jobs_lock:
             if jobs[job_id]["status"] == "cancel_requested":
                 jobs[job_id]["status"] = "canceled"
                 jobs[job_id]["message"] = "Transcription canceled"
+                logger.info("Job %s canceled before transcribe", job_id)
                 return
             jobs[job_id]["status"] = "transcribing"
             jobs[job_id]["message"] = "Transcribing audio"
@@ -229,12 +309,24 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
             jobs[job_id]["result_text"] = text_output
             jobs[job_id]["result_json"] = json_output
             jobs[job_id]["history_id"] = history_entry["id"]
+        logger.info("Job %s done segments=%s", job_id, len(segment_list))
     except Exception as exc:
+        logger.exception("Job %s failed: %s", job_id, exc)
         with jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["message"] = str(exc)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _start_job_thread(job_id: str, temp_path: Path, original_name: str) -> None:
+    thread = threading.Thread(
+        target=_run_job,
+        args=(job_id, temp_path, original_name),
+        daemon=True,
+        name=f"stt-job-{job_id[:8]}",
+    )
+    thread.start()
 
 
 def _cancel_job(job_id: str) -> dict:
@@ -246,6 +338,7 @@ def _cancel_job(job_id: str) -> dict:
             return dict(job)
         job["status"] = "cancel_requested"
         job["message"] = "Cancel requested"
+        logger.info("Job %s cancel requested", job_id)
         return dict(job)
 
 
@@ -263,8 +356,13 @@ async def _save_upload_to_temp(file: UploadFile) -> Path:
     return temp_path
 
 
-async def _create_job(file: UploadFile, response_format: str) -> dict:
+async def _create_job(
+    file: UploadFile,
+    response_format: str,
+    background_tasks: BackgroundTasks,
+) -> dict:
     temp_path = await _save_upload_to_temp(file)
+    size_mb = temp_path.stat().st_size / (1024 * 1024)
 
     job_id = uuid.uuid4().hex
 
@@ -282,8 +380,10 @@ async def _create_job(file: UploadFile, response_format: str) -> dict:
             "result_json": None,
         }
 
-    thread = threading.Thread(target=_run_job, args=(job_id, temp_path, file.filename), daemon=True)
-    thread.start()
+    # Start Whisper after the HTTP response is sent so an OOM during
+    # decode cannot turn the upload itself into a 502.
+    background_tasks.add_task(_start_job_thread, job_id, temp_path, file.filename)
+    logger.info("Job %s queued file=%s size_mb=%.1f", job_id, file.filename, size_mb)
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -711,6 +811,21 @@ def ui():
         .replaceAll("'", '&#39;');
     }
 
+    function gatewayUploadError(status, body) {
+      const hints = [];
+      if (status === 413) {
+        hints.push('Nginx rejected the file as too large. Set client_max_body_size 1024M in the Forge site Nginx config.');
+      } else if (status === 502 || status === 504 || status === 0) {
+        hints.push('The proxy closed the connection before transcription could start. Common causes: Nginx proxy timeouts, client_max_body_size too low, or the server ran out of memory on a long file.');
+        hints.push('For this app, Nginx needs client_max_body_size 1024M and proxy_read_timeout / proxy_send_timeout 3600s.');
+      }
+      const original = String(body || '').trim();
+      if (original) {
+        hints.push(original);
+      }
+      return hints.join('\\n\\n');
+    }
+
     function setActiveTab(tab) {
       const resultActive = tab === 'result';
       const historyActive = tab === 'history';
@@ -1014,7 +1129,7 @@ def ui():
 
       xhr.onerror = () => {
         status.textContent = 'Upload failed.';
-        result.textContent = 'Network error while uploading file.';
+        result.textContent = gatewayUploadError(0, 'Network error while uploading file.');
         activeXhr = null;
         submitBtn.disabled = false;
         urlSubmitBtn.disabled = false;
@@ -1034,7 +1149,7 @@ def ui():
         activeXhr = null;
         if (xhr.status < 200 || xhr.status >= 300) {
           status.textContent = `Request failed: ${xhr.status}`;
-          result.textContent = xhr.responseText;
+          result.textContent = gatewayUploadError(xhr.status, xhr.responseText);
           submitBtn.disabled = false;
           urlSubmitBtn.disabled = false;
           cancelBtn.disabled = true;
@@ -1252,18 +1367,20 @@ def ui():
 
 @app.post("/transcribe-jobs")
 async def create_transcription_job(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     response_format: str = Form("text"),
     _: None = Depends(require_api_key),
 ):
-    return await _create_job(file, response_format)
+    return await _create_job(file, response_format, background_tasks)
 
 @app.post("/ui/transcribe-jobs")
 async def create_ui_transcription_job(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     response_format: str = Form("text"),
 ):
-    return await _create_job(file, response_format)
+    return await _create_job(file, response_format, background_tasks)
 
 
 @app.post("/transcribe-url")
