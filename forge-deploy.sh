@@ -35,10 +35,18 @@ pkill -f "uvicorn server:app --host ${HOST} --port ${PORT}" || true
 
 export PYTHONUNBUFFERED=1
 export STT_LOG_FILE="${STT_LOG_FILE:-$LOG_FILE}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export CT2_USE_EXPERIMENTAL_PACKED_GEMM="${CT2_USE_EXPERIMENTAL_PACKED_GEMM:-0}"
 
 cd "${CURRENT_DIR}"
 # Line-buffer logs so the UI log tab is not empty if the process is killed (OOM/502).
 nohup env PYTHONUNBUFFERED=1 STT_LOG_FILE="${STT_LOG_FILE}" \
+  OMP_NUM_THREADS="${OMP_NUM_THREADS}" \
+  OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS}" \
+  MKL_NUM_THREADS="${MKL_NUM_THREADS}" \
+  CT2_USE_EXPERIMENTAL_PACKED_GEMM="${CT2_USE_EXPERIMENTAL_PACKED_GEMM}" \
   "${VENV_DIR}/bin/uvicorn" server:app --host "${HOST}" --port "${PORT}" --timeout-keep-alive 75 \
   > "${LOG_FILE}" 2>&1 &
 echo "$!" > "${PID_FILE}"

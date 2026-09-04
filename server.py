@@ -11,6 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
+# Cap native thread pools before ctranslate2/faster-whisper import so a
+# small Forge VM keeps CPU for nginx and Cloudflare health checks.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("CT2_USE_EXPERIMENTAL_PACKED_GEMM", "0")
+
 import av
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Header, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +44,50 @@ class ImmediateStreamHandler(logging.StreamHandler):
         self.flush()
 
 
+class _QuietPollAccessFilter(logging.Filter):
+    """Drop high-frequency UI poll GETs from uvicorn access logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        method = ""
+        path = ""
+        status = 0
+        scope = getattr(record, "scope", None)
+        if isinstance(scope, dict):
+            method = str(scope.get("method") or "")
+            path = str(scope.get("path") or "")
+            try:
+                status = int(getattr(record, "status_code", 0) or 0)
+            except (TypeError, ValueError):
+                status = 0
+        args = record.args
+        if not path and isinstance(args, tuple) and len(args) >= 5:
+            method = str(args[1])
+            path = str(args[2])
+            try:
+                status = int(args[4])
+            except (TypeError, ValueError):
+                status = 0
+        if path:
+            path = path.split("?", 1)[0]
+        if not path:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                return True
+            if " 200" not in msg:
+                return True
+            if "GET /ui/logs" in msg or "GET /ui/jobs/" in msg or '"GET /jobs/' in msg:
+                return False
+            return True
+        if status and status != 200:
+            return True
+        if method.upper() != "GET":
+            return True
+        if path == "/ui/logs" or path.startswith("/ui/jobs/") or path.startswith("/jobs/"):
+            return False
+        return True
+
+
 def _setup_logging() -> logging.Logger:
     logger = logging.getLogger("stt")
     if logger.handlers:
@@ -51,11 +102,19 @@ def _setup_logging() -> logging.Logger:
         logger.addHandler(file_handler)
     except OSError as exc:
         sys.stderr.write(f"Could not attach STT log file {LOG_FILE_PATH}: {exc}\n")
-    if sys.stdout.isatty():
-        stream_handler = ImmediateStreamHandler(sys.stdout)
-        stream_handler.setFormatter(formatter)
-        logger.addHandler(stream_handler)
+    # Always write to stdout. Forge runs under nohup, so stdout is not a TTY
+    # and an isatty() guard would drop Job queued/starting from uvicorn.log.
+    stream_handler = ImmediateStreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
     return logger
+
+
+def _install_access_log_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if any(isinstance(item, _QuietPollAccessFilter) for item in access_logger.filters):
+        return
+    access_logger.addFilter(_QuietPollAccessFilter())
 
 
 logger = _setup_logging()
@@ -110,12 +169,18 @@ app.add_middleware(
 )
 app.add_middleware(RequestLogMiddleware)
 
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _install_access_log_filter()
+
+
 logger.info("Loading Whisper model base.en (cpu/int8)...")
 model = WhisperModel(
     "base.en",
     device="cpu",
     compute_type="int8",
-    cpu_threads=2,
+    cpu_threads=1,
     num_workers=1,
 )
 logger.info("Whisper model ready")
@@ -223,6 +288,14 @@ def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def _lower_thread_priority() -> None:
+    """Lower this thread's niceness so nginx and the asyncio loop keep CPU."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+    except (AttributeError, OSError, PermissionError):
+        pass
+
+
 def _audio_duration_seconds(path: Path) -> float:
     try:
         with av.open(str(path)) as container:
@@ -237,6 +310,7 @@ def _audio_duration_seconds(path: Path) -> float:
 
 
 def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
+    _lower_thread_priority()
     file_size = temp_path.stat().st_size if temp_path.exists() else 0
     try:
         total_seconds = _audio_duration_seconds(temp_path)
@@ -268,6 +342,7 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
 
         segment_list = []
         lines = []
+        last_progress_bucket = 0
 
         for segment in segments:
             with jobs_lock:
@@ -288,6 +363,26 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
             with jobs_lock:
                 jobs[job_id]["progress"] = pct
                 jobs[job_id]["processed_seconds"] = segment.end
+
+            bucket = int(pct // 10)
+            if bucket > last_progress_bucket:
+                last_progress_bucket = bucket
+                logger.info(
+                    "Job %s progress=%.0f%% processed_s=%.1f total_s=%.1f segments=%s",
+                    job_id,
+                    pct,
+                    segment.end,
+                    total_seconds,
+                    len(segment_list),
+                )
+            elif total_seconds <= 0 and len(segment_list) % 25 == 0:
+                logger.info(
+                    "Job %s progress=%.0f%% processed_s=%.1f segments=%s",
+                    job_id,
+                    pct,
+                    segment.end,
+                    len(segment_list),
+                )
 
         text_output = "\n".join(lines)
         json_output = {
@@ -320,6 +415,8 @@ def _run_job(job_id: str, temp_path: Path, original_name: str) -> None:
 
 
 def _start_job_thread(job_id: str, temp_path: Path, original_name: str) -> None:
+    # Dedicated daemon thread so Whisper never occupies FastAPI's default threadpool
+    # or the asyncio event loop that must answer Cloudflare/nginx polls.
     thread = threading.Thread(
         target=_run_job,
         args=(job_id, temp_path, original_name),
@@ -826,6 +923,20 @@ def ui():
       return hints.join('\\n\\n');
     }
 
+    function isGatewayBusyStatus(status) {
+      return status === 502 || status === 503 || status === 504 || status === 522 || status === 524;
+    }
+
+    function historyBusyMessage() {
+      return 'Server busy transcribing, retry History in a minute.';
+    }
+
+    function showHistoryError(fallback, error) {
+      const text = String(error && error.message ? error.message : error);
+      status.textContent = text.includes('busy transcribing') ? historyBusyMessage() : fallback;
+      result.textContent = text;
+    }
+
     function setActiveTab(tab) {
       const resultActive = tab === 'result';
       const historyActive = tab === 'history';
@@ -878,6 +989,9 @@ def ui():
     async function loadHistoryDetail(id) {
       const res = await fetch(`/ui/history/${id}`);
       if (!res.ok) {
+        if (isGatewayBusyStatus(res.status)) {
+          throw new Error(historyBusyMessage());
+        }
         throw new Error(`History fetch failed (${res.status})`);
       }
       const entry = await res.json();
@@ -917,6 +1031,9 @@ def ui():
       const targetPage = Math.max(1, page);
       const res = await fetch(`/ui/history?page=${targetPage}&page_size=${historyPageSize}`);
       if (!res.ok) {
+        if (isGatewayBusyStatus(res.status)) {
+          throw new Error(historyBusyMessage());
+        }
         throw new Error(`History list failed (${res.status})`);
       }
       const data = await res.json();
@@ -986,16 +1103,46 @@ def ui():
       }
 
       const MAX_CONSECUTIVE_POLL_FAILURES = 8;
+      const MAX_GATEWAY_POLL_FAILURES = 240;
       let consecutivePollFailures = 0;
+      let consecutiveGatewayFailures = 0;
+
+      const stopPollingOnError = (error) => {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        transcribeBar.classList.remove('busy');
+        status.textContent = 'Progress check failed. The job may still finish in the background — check History shortly.';
+        result.textContent = String(error);
+        activeJobId = null;
+        submitBtn.disabled = false;
+        urlSubmitBtn.disabled = false;
+        cancelBtn.disabled = true;
+        refreshHistory().catch(() => {});
+      };
 
       const tick = async () => {
         try {
           const res = await fetch(`/ui/jobs/${jobId}`);
           if (!res.ok) {
-            throw new Error(`Status ${res.status}`);
+            if (isGatewayBusyStatus(res.status)) {
+              consecutiveGatewayFailures += 1;
+              if (consecutiveGatewayFailures < MAX_GATEWAY_POLL_FAILURES) {
+                status.textContent = `Server busy (HTTP ${res.status}). Transcription may still be running — retrying...`;
+                return;
+              }
+            } else {
+              consecutivePollFailures += 1;
+              if (consecutivePollFailures < MAX_CONSECUTIVE_POLL_FAILURES) {
+                status.textContent = `Progress check failed, retrying... (Status ${res.status})`;
+                return;
+              }
+            }
+            stopPollingOnError(`Status ${res.status}`);
+            return;
           }
 
           consecutivePollFailures = 0;
+          consecutiveGatewayFailures = 0;
 
           const data = await res.json();
           if (typeof data.progress === 'number') {
@@ -1061,22 +1208,12 @@ def ui():
             return;
           }
         } catch (error) {
-          consecutivePollFailures += 1;
-          if (consecutivePollFailures < MAX_CONSECUTIVE_POLL_FAILURES) {
+          consecutiveGatewayFailures += 1;
+          if (consecutiveGatewayFailures < MAX_GATEWAY_POLL_FAILURES) {
             status.textContent = `Progress check failed, retrying... (${error})`;
             return;
           }
-
-          clearInterval(pollTimer);
-          pollTimer = null;
-          transcribeBar.classList.remove('busy');
-          status.textContent = 'Progress check failed. The job may still finish in the background — check History shortly.';
-          result.textContent = String(error);
-          activeJobId = null;
-          submitBtn.disabled = false;
-          urlSubmitBtn.disabled = false;
-          cancelBtn.disabled = true;
-          refreshHistory().catch(() => {});
+          stopPollingOnError(error);
         }
       };
 
@@ -1296,16 +1433,14 @@ def ui():
     historyTabBtn.addEventListener('click', () => {
       setActiveTab('history');
       refreshHistory().catch((error) => {
-        status.textContent = 'Failed to load history.';
-        result.textContent = String(error);
+        showHistoryError('Failed to load history.', error);
       });
     });
     logTabBtn.addEventListener('click', () => setActiveTab('log'));
     refreshLogBtn.addEventListener('click', () => refreshLog().catch(() => {}));
     refreshHistoryBtn.addEventListener('click', () => {
       refreshHistory(1).catch((error) => {
-        status.textContent = 'Failed to refresh history.';
-        result.textContent = String(error);
+        showHistoryError('Failed to refresh history.', error);
       });
     });
     historyPrevBtn.addEventListener('click', () => {
@@ -1313,8 +1448,7 @@ def ui():
         return;
       }
       refreshHistory(historyPage - 1).catch((error) => {
-        status.textContent = 'Failed to load previous history page.';
-        result.textContent = String(error);
+        showHistoryError('Failed to load previous history page.', error);
       });
     });
     historyNextBtn.addEventListener('click', () => {
@@ -1322,8 +1456,7 @@ def ui():
         return;
       }
       refreshHistory(historyPage + 1).catch((error) => {
-        status.textContent = 'Failed to load next history page.';
-        result.textContent = String(error);
+        showHistoryError('Failed to load next history page.', error);
       });
     });
     historyList.addEventListener('click', (event) => {
@@ -1336,8 +1469,7 @@ def ui():
         return;
       }
       loadHistoryDetail(id).catch((error) => {
-        status.textContent = 'Failed to load history entry.';
-        result.textContent = String(error);
+        showHistoryError('Failed to load history entry.', error);
       });
     });
 
