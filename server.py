@@ -50,6 +50,8 @@ history_lock = threading.Lock()
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 HISTORY_DIR = Path("transcripts_history")
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE_PATH = Path(os.getenv("STT_LOG_FILE", "../uvicorn.log"))
+LOG_TAIL_MAX_BYTES = 200_000
 
 
 def _safe_base_name(filename: str | None) -> str:
@@ -80,6 +82,21 @@ def _persist_history(filename: str | None, text_output: str, json_output: dict) 
         "basename": record["basename"],
         "created_at": record["created_at"],
     }
+
+
+def _tail_log(max_lines: int) -> dict:
+    if not LOG_FILE_PATH.exists():
+        return {"path": str(LOG_FILE_PATH), "available": False, "lines": []}
+
+    with LOG_FILE_PATH.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - LOG_TAIL_MAX_BYTES))
+        chunk = f.read()
+
+    text = chunk.decode("utf-8", errors="replace")
+    lines = text.splitlines()[-max_lines:]
+    return {"path": str(LOG_FILE_PATH), "available": True, "lines": lines}
 
 
 def _list_history(page: int = 1, page_size: int = 20) -> dict:
@@ -608,6 +625,7 @@ def ui():
       <div class=\"tabs\">
         <button id=\"result-tab-btn\" class=\"tab-btn active\" type=\"button\">Result</button>
         <button id=\"history-tab-btn\" class=\"tab-btn\" type=\"button\">History</button>
+        <button id=\"log-tab-btn\" class=\"tab-btn\" type=\"button\">Server Log</button>
       </div>
 
       <div id=\"result-panel\">
@@ -625,6 +643,16 @@ def ui():
         </div>
         <div id=\"history-list\" class=\"history-list\"></div>
       </div>
+
+      <div id=\"log-panel\" class=\"hidden\">
+        <div class=\"history-actions\">
+          <div class=\"history-controls\">
+            <button id=\"refresh-log-btn\" type=\"button\">Refresh Now</button>
+            <span id=\"log-path-info\" class=\"history-page-info\"></span>
+          </div>
+        </div>
+        <pre id=\"log-output\"></pre>
+      </div>
     </div>
   </div>
 
@@ -641,8 +669,14 @@ def ui():
     const downloadJsonBtn = document.getElementById('download-json-btn');
     const resultTabBtn = document.getElementById('result-tab-btn');
     const historyTabBtn = document.getElementById('history-tab-btn');
+    const logTabBtn = document.getElementById('log-tab-btn');
     const resultPanel = document.getElementById('result-panel');
     const historyPanel = document.getElementById('history-panel');
+    const logPanel = document.getElementById('log-panel');
+    const logOutput = document.getElementById('log-output');
+    const logPathInfo = document.getElementById('log-path-info');
+    const refreshLogBtn = document.getElementById('refresh-log-btn');
+    let logPollTimer = null;
     const refreshHistoryBtn = document.getElementById('refresh-history-btn');
     const historyPrevBtn = document.getElementById('history-prev-btn');
     const historyNextBtn = document.getElementById('history-next-btn');
@@ -679,10 +713,39 @@ def ui():
 
     function setActiveTab(tab) {
       const resultActive = tab === 'result';
+      const historyActive = tab === 'history';
+      const logActive = tab === 'log';
       resultTabBtn.classList.toggle('active', resultActive);
-      historyTabBtn.classList.toggle('active', !resultActive);
+      historyTabBtn.classList.toggle('active', historyActive);
+      logTabBtn.classList.toggle('active', logActive);
       resultPanel.classList.toggle('hidden', !resultActive);
-      historyPanel.classList.toggle('hidden', resultActive);
+      historyPanel.classList.toggle('hidden', !historyActive);
+      logPanel.classList.toggle('hidden', !logActive);
+
+      if (logActive) {
+        refreshLog().catch(() => {});
+        if (!logPollTimer) {
+          logPollTimer = setInterval(() => refreshLog().catch(() => {}), 3000);
+        }
+      } else if (logPollTimer) {
+        clearInterval(logPollTimer);
+        logPollTimer = null;
+      }
+    }
+
+    async function refreshLog() {
+      const res = await fetch('/ui/logs?lines=300');
+      if (!res.ok) {
+        throw new Error(`Log fetch failed (${res.status})`);
+      }
+      const data = await res.json();
+      logPathInfo.textContent = data.available ? data.path : `${data.path} (not found yet)`;
+      const wasScrolledToBottom =
+        logOutput.scrollTop + logOutput.clientHeight >= logOutput.scrollHeight - 20;
+      logOutput.textContent = (data.lines || []).join('\\n');
+      if (wasScrolledToBottom) {
+        logOutput.scrollTop = logOutput.scrollHeight;
+      }
     }
 
     function hydrateResult(entry) {
@@ -1122,6 +1185,8 @@ def ui():
         result.textContent = String(error);
       });
     });
+    logTabBtn.addEventListener('click', () => setActiveTab('log'));
+    refreshLogBtn.addEventListener('click', () => refreshLog().catch(() => {}));
     refreshHistoryBtn.addEventListener('click', () => {
       refreshHistory(1).catch((error) => {
         status.textContent = 'Failed to refresh history.';
@@ -1264,6 +1329,11 @@ def list_ui_history(
 @app.get("/ui/history/{history_id}")
 def get_ui_history(history_id: str):
     return _read_history(history_id)
+
+
+@app.get("/ui/logs")
+def get_ui_logs(lines: int = Query(200, ge=1, le=2000)):
+    return _tail_log(lines)
 
 
 @app.post("/transcribe")
